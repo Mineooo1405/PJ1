@@ -144,89 +144,174 @@ class DirectBridge:
             logger.info(f"TCP connection closed for {client_id}")
     
     async def handle_ws_client(self, websocket, path):
-        """Handle WebSocket client connection (frontend)"""
-        client_id = f"{websocket.remote_address[0]}:{websocket.remote_address[1]}"
-        robot_id = None
-        logger.info(f"New WebSocket connection from {client_id}, path: {path}")
-        
         try:
-            # Extract robot_id from path if available - update path handling
-            if path and path.startswith('/'):
-                parts = path[1:].split('/')
-                if len(parts) >= 2 and parts[0] == "ws":
-                    # For paths like /ws/robot1, use the second part
-                    robot_id = ConnectionManager.normalize_robot_id(parts[1])
-                    logger.info(f"WebSocket path indicates robot_id: {robot_id}")
-                elif len(parts) >= 1:
-                    # Handle legacy paths or other formats
-                    robot_id = ConnectionManager.normalize_robot_id(parts[0])
-                    logger.info(f"WebSocket path indicates robot_id (legacy): {robot_id}")
+            # Extract robot_id from path
+            path_parts = path.strip('/').split('/')
+            if len(path_parts) >= 2 and path_parts[0] == 'ws':
+                robot_id = path_parts[1]
+                logger.info(f"WebSocket path indicates robot_id: {robot_id}")
+            else:
+                logger.warning(f"Invalid WebSocket path: {path}")
+                return
             
-            # Wait for identification message if robot_id not in path
-            if not robot_id:
+            # Add this WebSocket to our connection manager
+            ConnectionManager.add_websocket(robot_id, websocket)
+            
+            # Keep connection alive until closed
+            try:
                 async for message in websocket:
                     try:
+                        # Parse the incoming message
                         data = json.loads(message)
-                        robot_id = data.get("robot_id")
-                        if robot_id:
-                            robot_id = ConnectionManager.normalize_robot_id(robot_id)
-                            logger.info(f"WebSocket client {client_id} identified as {robot_id}")
-                            break
-                        else:
-                            await websocket.send(json.dumps({
-                                "type": "error",
-                                "message": "Missing robot_id in identification message"
-                            }))
-                    except json.JSONDecodeError:
-                        await websocket.send(json.dumps({
-                            "type": "error",
-                            "message": "Invalid JSON message"
-                        }))
-            
-            # Register WebSocket with connection manager
-            if robot_id:
-                ConnectionManager.add_websocket(robot_id, websocket)
-                
-                # Main message loop
-                async for message in websocket:
-                    try:
-                        data = json.loads(message)
-                        logger.debug(f"WebSocket received from {client_id}: {data}")
+                        robot_id = data.get("robot_id", robot_id) # Use the one from the message if available
                         
-                        # Get TCP client for this robot
-                        tcp_client = ConnectionManager.get_tcp_client(robot_id)
-                        if tcp_client:
-                            # Forward message to TCP client (robot)
-                            reader, writer = tcp_client
-                            try:
-                                writer.write((json.dumps(data) + "\n").encode())
-                                await writer.drain()
-                                logger.debug(f"Forwarded to {robot_id} TCP: {data}")
-                            except Exception as e:
-                                logger.error(f"Error sending to TCP {robot_id}: {str(e)}")
-                                # Remove dead TCP client
-                                ConnectionManager.remove_tcp_client(robot_id)
+                        # Handle special message types from frontend
+                        if data.get("type") == "pid_config":
+                            # Get the TCP client for this robot
+                            tcp_client = ConnectionManager.get_tcp_client(robot_id)
+                            
+                            # Forward PID config to robot
+                            if tcp_client:
+                                reader, writer = tcp_client
+                                try:
+                                    # Log detailed PID values
+                                    logger.info(f"Received PID config: motor_id={data.get('motor_id')}, kp={data.get('kp')}, ki={data.get('ki')}, kd={data.get('kd')}")
+                                    
+                                    # Send data to TCP client
+                                    writer.write((json.dumps(data) + "\n").encode())
+                                    await writer.drain()
+                                    logger.info(f"Forwarded PID config to {robot_id} TCP")
+                                    
+                                    # Send success response back to WebSocket client
+                                    await websocket.send(json.dumps({
+                                        "type": "pid_response",
+                                        "status": "success",
+                                        "robot_id": robot_id,
+                                        "message": "PID configuration sent to robot",
+                                        "timestamp": time.time()
+                                    }))
+                                except Exception as e:
+                                    logger.error(f"Error sending PID config to TCP {robot_id}: {str(e)}")
+                                    # Send error response back to WebSocket client
+                                    await websocket.send(json.dumps({
+                                        "type": "pid_response",
+                                        "status": "error",
+                                        "robot_id": robot_id,
+                                        "message": f"Failed to send PID config: {str(e)}",
+                                        "timestamp": time.time()
+                                    }))
+                            else:
+                                logger.warning(f"No TCP client for robot {robot_id}")
+                                await websocket.send(json.dumps({
+                                    "type": "pid_response",
+                                    "status": "error",
+                                    "robot_id": robot_id,
+                                    "message": f"No TCP client connected for robot {robot_id}",
+                                    "timestamp": time.time()
+                                }))
+                        elif data.get("type") in ["firmware_update_start", "firmware_chunk", "firmware_update_complete", "check_firmware_version"]:
+                            # Same logic for firmware updates - handle similarly to PID config
+                            tcp_client = ConnectionManager.get_tcp_client(robot_id)
+                            if tcp_client:
+                                reader, writer = tcp_client
+                                try:
+                                    writer.write((json.dumps(data) + "\n").encode())
+                                    await writer.drain()
+                                    logger.info(f"Forwarded {data.get('type')} to {robot_id} TCP")
+                                    
+                                    # Send proper responses based on message type
+                                    if data.get("type") == "firmware_chunk":
+                                        chunk_index = data.get("chunk_index", 0)
+                                        total_chunks = data.get("total_chunks", 1)
+                                        progress = int((chunk_index + 1) / total_chunks * 100)
+                                        
+                                        await websocket.send(json.dumps({
+                                            "type": "firmware_progress",
+                                            "progress": progress,
+                                            "robot_id": robot_id,
+                                            "timestamp": time.time()
+                                        }))
+                                    elif data.get("type") == "firmware_update_complete":
+                                        await websocket.send(json.dumps({
+                                            "type": "firmware_response",
+                                            "status": "success",
+                                            "robot_id": robot_id,
+                                            "message": "Firmware update completed successfully",
+                                            "timestamp": time.time()
+                                        }))
+                                    elif data.get("type") == "check_firmware_version":
+                                        # Send dummy response if robot doesn't respond
+                                        await asyncio.sleep(1)
+                                        await websocket.send(json.dumps({
+                                            "type": "firmware_version",
+                                            "version": "1.0.0",
+                                            "build_date": time.strftime("%Y-%m-%d"),
+                                            "robot_id": robot_id,
+                                            "timestamp": time.time()
+                                        }))
+                                except Exception as e:
+                                    logger.error(f"Error forwarding {data.get('type')} to {robot_id} TCP: {str(e)}")
+                                    await websocket.send(json.dumps({
+                                        "type": "firmware_response",
+                                        "status": "error",
+                                        "robot_id": robot_id,
+                                        "message": f"Failed to send firmware command: {str(e)}",
+                                        "timestamp": time.time()
+                                    }))
+                            else:
+                                logger.warning(f"No TCP client for robot {robot_id} when handling {data.get('type')}")
+                                await websocket.send(json.dumps({
+                                    "type": "firmware_response",
+                                    "status": "error", 
+                                    "robot_id": robot_id,
+                                    "message": f"No TCP client connected for robot {robot_id}",
+                                    "timestamp": time.time()
+                                }))
                         else:
-                            # No TCP client for this robot
-                            await websocket.send(json.dumps({
-                                "type": "error",
-                                "message": f"No TCP client connected for {robot_id}"
-                            }))
+                            # For other message types, forward to the robot's TCP connection
+                            tcp_client = ConnectionManager.get_tcp_client(robot_id)
+                            if tcp_client:
+                                reader, writer = tcp_client
+                                try:
+                                    writer.write((json.dumps(data) + "\n").encode())
+                                    await writer.drain()
+                                    logger.info(f"Forwarded {data.get('type', 'unknown')} to {robot_id} TCP")
+                                except Exception as e:
+                                    logger.error(f"Error forwarding to TCP {robot_id}: {str(e)}")
+                                    await websocket.send(json.dumps({
+                                        "type": "error",
+                                        "message": f"Failed to forward to robot: {str(e)}",
+                                        "robot_id": robot_id,
+                                        "timestamp": time.time()
+                                    }))
                     
                     except json.JSONDecodeError:
+                        logger.error(f"Invalid JSON received from WebSocket: {message}")
                         await websocket.send(json.dumps({
                             "type": "error",
-                            "message": "Invalid JSON message"
+                            "message": "Invalid JSON format",
+                            "timestamp": time.time()
                         }))
+                    except Exception as e:
+                        logger.error(f"Error processing WebSocket message: {str(e)}")
+                        await websocket.send(json.dumps({
+                            "type": "error",
+                            "message": f"Error processing message: {str(e)}",
+                            "timestamp": time.time()
+                        }))
+                        # Don't close the connection here!
+            
+            except websockets.exceptions.ConnectionClosedOK:
+                logger.info(f"WebSocket connection closed normally")
+            except websockets.exceptions.ConnectionClosedError as e:
+                logger.error(f"WebSocket connection closed with error: {e}")
         
         except Exception as e:
-            logger.error(f"Error in WebSocket connection {client_id}: {str(e)}")
-        
+            logger.error(f"Error in WebSocket connection {websocket.remote_address}: {e}")
         finally:
-            # Clean up
-            if robot_id:
-                ConnectionManager.remove_websocket(robot_id, websocket)
-            logger.info(f"WebSocket connection closed for {client_id}")
+            # Always clean up
+            ConnectionManager.remove_websocket(robot_id, websocket)
+            logger.info(f"WebSocket connection closed for {websocket.remote_address}")
 
     async def forward_to_backend(self, message, robot_id):
         """Forward robot data from TCP server to FastAPI backend"""

@@ -1,199 +1,226 @@
-import { BehaviorSubject } from 'rxjs';
-
-// Define WebSocket statuses
-type WebSocketStatus = 'disconnected' | 'connecting' | 'connected' | 'error';
+import { EventEmitter } from 'events';
 
 class TcpWebSocketService {
   private socket: WebSocket | null = null;
-  private url: string;
-  private messageListeners: Map<string, Set<(data: any) => void>> = new Map();
-  private connectionChangeListeners: Set<() => void> = new Set();
-  private pingInterval: number | null = null;
-  private status: BehaviorSubject<WebSocketStatus> = new BehaviorSubject<WebSocketStatus>('disconnected');
+  private events = new EventEmitter();
+  private connecting = false;
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private robotId = 'robot1';
   
   constructor() {
-    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const hostname = window.location.hostname === 'localhost' ? 'localhost:9003' : window.location.host;
-    this.url = `${protocol}//${hostname}/ws/server`;
+    this.events.setMaxListeners(20);
   }
-  
-  // Connect to WebSocket server
-  public connect(): void {
-    if (this.socket && 
-        (this.socket.readyState === WebSocket.OPEN || 
-         this.socket.readyState === WebSocket.CONNECTING)) {
+
+  setRobotId(robotId: string) {
+    this.robotId = robotId;
+    
+    // Reconnect if already connected
+    if (this.isConnected()) {
+      this.disconnect();
+      this.connect();
+    }
+  }
+
+  connect() {
+    // Cancel any pending reconnect
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    
+    if (this.socket && (this.socket.readyState === WebSocket.OPEN || this.socket.readyState === WebSocket.CONNECTING)) {
+      console.log('WebSocket is already connected or connecting');
       return;
     }
     
-    this.status.next('connecting');
+    if (this.connecting) {
+      console.log('Connection already in progress');
+      return;
+    }
+    
+    this.connecting = true;
     
     try {
-      console.log(`[TCP WebSocket] Connecting to ${this.url}...`);
-      this.socket = new WebSocket(this.url);
+      // Connect to direct_bridge WebSocket server
+      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const host = window.location.hostname || 'localhost';
+      const port = 9003; // direct_bridge WebSocket port
+      
+      const url = `${protocol}//${host}:${port}/ws/${this.robotId}`;
+      
+      console.log(`Connecting to direct_bridge WebSocket at ${url}`);
+      this.socket = new WebSocket(url);
       
       this.socket.onopen = () => {
-        console.log(`[TCP WebSocket] Connected to ${this.url}`);
-        this.status.next('connected');
+        console.log('WebSocket connection to direct_bridge established');
+        this.connecting = false;
+        this.events.emit('connectionChange', true);
         
-        // Start ping interval
-        this.startPingInterval();
-        
-        // Notify connection change listeners
-        this.notifyConnectionChange();
+        // Send identification message
+        this.sendMessage({
+          type: 'registration',
+          robot_id: this.robotId,
+          client_type: 'frontend'
+        });
       };
       
-      this.socket.onclose = () => {
-        console.log(`[TCP WebSocket] Disconnected from ${this.url}`);
-        this.status.next('disconnected');
+      this.socket.onclose = (event) => {
+        console.log(`WebSocket connection closed: ${event.code} - ${event.reason}`);
+        this.connecting = false;
+        this.events.emit('connectionChange', false);
         this.socket = null;
         
-        // Stop ping interval
-        this.stopPingInterval();
-        
-        // Notify connection change listeners
-        this.notifyConnectionChange();
+        // Try to reconnect after delay if not manually disconnected
+        if (event.code !== 1000 || event.reason !== 'Closed by client') {
+          this.scheduleReconnect();
+        }
       };
       
       this.socket.onerror = (error) => {
-        console.error(`[TCP WebSocket] Error on ${this.url}:`, error);
-        this.status.next('error');
+        console.error('WebSocket error:', error);
+        this.connecting = false;
+        this.events.emit('connectionChange', false);
         
-        // Notify connection change listeners
-        this.notifyConnectionChange();
+        // Socket error typically means we should reconnect
+        if (this.socket) {
+          this.socket.close();
+          this.socket = null;
+          this.scheduleReconnect();
+        }
       };
       
       this.socket.onmessage = (event) => {
         try {
           const data = JSON.parse(event.data);
+          console.log('Received WebSocket message:', data);
           
-          // Process message based on type
-          const messageType = data.type || '*';
+          // Forward message to listeners
+          this.events.emit('message', data);
           
-          // Call specific type listeners
-          if (this.messageListeners.has(messageType)) {
-            this.messageListeners.get(messageType)!.forEach(listener => {
-              try {
-                listener(data);
-              } catch (err) {
-                console.error(`[TCP WebSocket] Error in message listener for type ${messageType}:`, err);
-              }
-            });
+          // Also emit based on message type if available
+          if (data.type) {
+            this.events.emit(`message:${data.type}`, data);
           }
-          
-          // Call wildcard listeners
-          if (this.messageListeners.has('*')) {
-            this.messageListeners.get('*')!.forEach(listener => {
-              try {
-                listener(data);
-              } catch (err) {
-                console.error(`[TCP WebSocket] Error in wildcard listener:`, err);
-              }
-            });
-          }
-        } catch (err) {
-          console.error(`[TCP WebSocket] Error parsing message:`, err);
+        } catch (error) {
+          console.error('Error parsing WebSocket message:', error);
         }
       };
-    } catch (err) {
-      console.error(`[TCP WebSocket] Error creating connection:`, err);
-      this.status.next('error');
+    } catch (error) {
+      console.error('Error creating WebSocket connection:', error);
+      this.connecting = false;
+      this.events.emit('connectionChange', false);
+      this.scheduleReconnect();
     }
   }
   
-  // Disconnect from WebSocket server
-  public disconnect(): void {
+  disconnect() {
     if (this.socket) {
-      this.socket.close();
+      this.socket.close(1000, 'Closed by client');
       this.socket = null;
     }
     
-    this.status.next('disconnected');
-    this.stopPingInterval();
-  }
-  
-  // Send a message to the WebSocket server
-  public sendMessage(message: any): boolean {
-    if (this.socket && this.socket.readyState === WebSocket.OPEN) {
-      this.socket.send(JSON.stringify(message));
-      return true;
-    }
-    
-    return false;
-  }
-  
-  // Register a message listener for a specific type
-  public onMessage(type: string, callback: (data: any) => void): void {
-    if (!this.messageListeners.has(type)) {
-      this.messageListeners.set(type, new Set());
-    }
-    
-    this.messageListeners.get(type)!.add(callback);
-  }
-  
-  // Unregister a message listener
-  public offMessage(type: string, callback: (data: any) => void): void {
-    if (this.messageListeners.has(type)) {
-      this.messageListeners.get(type)!.delete(callback);
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
     }
   }
   
-  // Register a connection change listener
-  public onConnectionChange(callback: () => void): void {
-    this.connectionChangeListeners.add(callback);
-  }
-  
-  // Unregister a connection change listener
-  public offConnectionChange(callback: () => void): void {
-    this.connectionChangeListeners.delete(callback);
-  }
-  
-  // Check if the WebSocket is connected
-  public isConnected(): boolean {
+  isConnected(): boolean {
     return this.socket !== null && this.socket.readyState === WebSocket.OPEN;
   }
   
-  // Get current connection status
-  public getStatus(): WebSocketStatus {
-    return this.status.value;
-  }
-  
-  // Subscribe to status changes
-  public onStatusChange(callback: (status: WebSocketStatus) => void): () => void {
-    const subscription = this.status.subscribe(callback);
-    return () => subscription.unsubscribe();
-  }
-  
-  // Start ping interval to keep connection alive
-  private startPingInterval(): void {
-    this.stopPingInterval();
+  private scheduleReconnect() {
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+    }
     
-    this.pingInterval = window.setInterval(() => {
-      if (this.socket && this.socket.readyState === WebSocket.OPEN) {
-        this.sendMessage({ type: "ping", timestamp: Date.now() / 1000 });
-      }
-    }, 30000);
+    this.reconnectTimer = setTimeout(() => {
+      console.log('Attempting to reconnect WebSocket...');
+      this.connect();
+    }, 2000); // Try after 2 seconds
   }
   
-  // Stop ping interval
-  private stopPingInterval(): void {
-    if (this.pingInterval !== null) {
-      clearInterval(this.pingInterval);
-      this.pingInterval = null;
+  sendMessage(message: any): boolean {
+    if (!this.isConnected()) {
+      console.error('Cannot send message, WebSocket is not connected');
+      // Try to reconnect if not connected
+      this.connect();
+      return false;
+    }
+    
+    try {
+      // Add robot_id and timestamp if not already present
+      if (!message.robot_id) {
+        message.robot_id = this.robotId;
+      }
+      
+      if (!message.timestamp) {
+        message.timestamp = Date.now() / 1000;
+      }
+      
+      // Log the message being sent
+      console.log('Sending WebSocket message:', message);
+      
+      // Send the message
+      this.socket!.send(JSON.stringify(message));
+      return true;
+    } catch (error) {
+      console.error('Error sending WebSocket message:', error);
+      
+      // If we got an error while sending, the socket might be broken
+      // Schedule a reconnection attempt
+      if (this.socket) {
+        this.socket.close(); // Force close to trigger reconnect
+        this.socket = null;
+        this.scheduleReconnect();
+      }
+      
+      return false;
     }
   }
   
-  // Notify all connection change listeners
-  private notifyConnectionChange(): void {
-    this.connectionChangeListeners.forEach(listener => {
-      try {
-        listener();
-      } catch (err) {
-        console.error(`[TCP WebSocket] Error in connection change listener:`, err);
-      }
+  // Send PID configuration directly to robot via direct_bridge
+  sendPidConfig(robotId: string, motorId: number, pidValues: any): boolean {
+    return this.sendMessage({
+      type: 'pid_config',
+      robot_id: robotId,
+      motor_id: motorId,
+      kp: pidValues.kp,
+      ki: pidValues.ki,
+      kd: pidValues.kd
     });
+  }
+  
+  // Event listeners
+  onMessage(type: string | 'message', callback: (data: any) => void) {
+    if (type === 'message') {
+      this.events.on('message', callback);
+    } else {
+      this.events.on(`message:${type}`, callback);
+    }
+    return this;
+  }
+  
+  offMessage(type: string | 'message', callback: (data: any) => void) {
+    if (type === 'message') {
+      this.events.off('message', callback);
+    } else {
+      this.events.off(`message:${type}`, callback);
+    }
+    return this;
+  }
+  
+  onConnectionChange(callback: (connected: boolean) => void) {
+    this.events.on('connectionChange', callback);
+    return this;
+  }
+  
+  offConnectionChange(callback: (connected: boolean) => void) {
+    this.events.off('connectionChange', callback);
+    return this;
   }
 }
 
-// Create and export singleton instance
+// Create a singleton instance
 const tcpWebSocketService = new TcpWebSocketService();
 export default tcpWebSocketService;

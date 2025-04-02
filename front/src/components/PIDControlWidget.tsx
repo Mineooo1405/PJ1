@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { RefreshCw, Power, Save, RotateCcw } from 'lucide-react';
 import tcpWebSocketService from '../services/TcpWebSocketService';
+import { useRobotContext } from './RobotContext';
 
 // Interface cho thông số PID
 interface PIDValues {
@@ -10,62 +11,69 @@ interface PIDValues {
 }
 
 const PIDControlWidget: React.FC = () => {
+  const { selectedRobotId } = useRobotContext();
+  
   // State
   const [pidValues, setPidValues] = useState<PIDValues>({
     kp: 1.0,
     ki: 0.1,
     kd: 0.01
   });
-  const [robotId, setRobotId] = useState('robot1');
   const [motorId, setMotorId] = useState(1);
   const [isSaving, setIsSaving] = useState(false);
   const [saveStatus, setSaveStatus] = useState<'idle' | 'success' | 'error'>('idle');
   const [isConnected, setIsConnected] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   
-  // Kết nối đến TCP WebSocket service khi component được tạo
+  // Cập nhật robotId khi selectedRobotId thay đổi
+  useEffect(() => {
+    if (selectedRobotId) {
+      tcpWebSocketService.setRobotId(selectedRobotId);
+    }
+  }, [selectedRobotId]);
+  
+  // Kết nối đến DirectBridge WebSocket service
   useEffect(() => {
     // Xử lý thay đổi trạng thái kết nối
     const handleConnectionChange = (connected: boolean) => {
-      console.log('Trạng thái kết nối TCP đã thay đổi:', connected);
+      console.log('Trạng thái kết nối DirectBridge đã thay đổi:', connected);
       setIsConnected(connected);
     };
     
-    // Đăng ký lắng nghe thay đổi kết nối
-    tcpWebSocketService.onConnectionChange(handleConnectionChange);
-    
-    // Kết nối đến TCP server
-    if (!tcpWebSocketService.isConnected()) {
-      tcpWebSocketService.connect();
-    }
-    
-    // Đăng ký nhận phản hồi
+    // Xử lý phản hồi PID
     const handlePidResponse = (response: any) => {
       console.log('Nhận phản hồi PID:', response);
       setIsSaving(false);
       
       if (response.status === 'success') {
         setSaveStatus('success');
-        console.log('Cấu hình PID đã được gửi thành công đến robot');
+        setTimeout(() => setSaveStatus('idle'), 3000);
       } else {
         setSaveStatus('error');
-        console.error('Lỗi gửi cấu hình PID:', response.message);
+        setErrorMessage(response.message || 'Unknown error');
+        setTimeout(() => setSaveStatus('idle'), 3000);
       }
     };
     
-    // Đăng ký nhận các loại phản hồi
+    // Đăng ký lắng nghe sự kiện
+    tcpWebSocketService.onConnectionChange(handleConnectionChange);
     tcpWebSocketService.onMessage('pid_response', handlePidResponse);
     tcpWebSocketService.onMessage('error', (error: any) => {
-      console.error('Lỗi từ TCP server:', error);
+      console.error('Lỗi từ server:', error);
       setIsSaving(false);
       setSaveStatus('error');
+      setErrorMessage(error.message || 'Unknown error');
+      setTimeout(() => setSaveStatus('idle'), 3000);
     });
+    
+    // Kiểm tra trạng thái kết nối hiện tại
+    setIsConnected(tcpWebSocketService.isConnected());
     
     // Dọn dẹp khi unmount
     return () => {
       tcpWebSocketService.offConnectionChange(handleConnectionChange);
       tcpWebSocketService.offMessage('pid_response', handlePidResponse);
-      tcpWebSocketService.offMessage('error', (error: any) => {});
+      tcpWebSocketService.offMessage('error', () => {});
     };
   }, []);
   
@@ -78,31 +86,36 @@ const PIDControlWidget: React.FC = () => {
     }));
   };
   
-  // Yêu cầu cập nhật PID
+  // Lưu và gửi cấu hình PID
   const handleSave = async () => {
     if (!isConnected) {
-      setErrorMessage("TCP connection not available");
+      setErrorMessage("Chưa kết nối tới DirectBridge");
+      setSaveStatus('error');
+      setTimeout(() => setSaveStatus('idle'), 3000);
       return;
     }
     
     setIsSaving(true);
+    setSaveStatus('idle');
+    setErrorMessage(null);
     
     try {
-      tcpWebSocketService.sendPidConfig(
-        robotId,
+      const success = tcpWebSocketService.sendPidConfig(
+        selectedRobotId,
         motorId,
         pidValues
       );
       
-      // Hiển thị thông báo thành công
-      setSaveStatus('success');
-      setTimeout(() => setSaveStatus('idle'), 3000);
+      if (!success) {
+        throw new Error("Không thể gửi thông số PID");
+      }
+      
+      // Phản hồi sẽ được xử lý bởi handlePidResponse
     } catch (error) {
       setSaveStatus('error');
-      setErrorMessage("Failed to save PID values");
-      setTimeout(() => setSaveStatus('idle'), 3000);
-    } finally {
+      setErrorMessage(error instanceof Error ? error.message : "Lỗi không xác định");
       setIsSaving(false);
+      setTimeout(() => setSaveStatus('idle'), 3000);
     }
   };
   
@@ -113,18 +126,18 @@ const PIDControlWidget: React.FC = () => {
       ki: 0.1,
       kd: 0.01
     });
+    setSaveStatus('idle');
+    setErrorMessage(null);
   };
   
-  // Kết nối đến TCP server
+  // Kết nối đến DirectBridge
   const connect = () => {
     tcpWebSocketService.connect();
-    // Trạng thái kết nối sẽ được cập nhật thông qua onConnectionChange
   };
   
   // Ngắt kết nối
   const disconnect = () => {
     tcpWebSocketService.disconnect();
-    // Trạng thái kết nối sẽ được cập nhật thông qua onConnectionChange
   };
   
   // Render UI
@@ -158,33 +171,18 @@ const PIDControlWidget: React.FC = () => {
         )}
       </div>
       
-      {/* Chọn Robot và Motor */}
-      <div className="grid grid-cols-2 gap-4 mb-2">
-        <div>
-          <label className="block text-sm font-medium text-gray-700 mb-1">Robot</label>
-          <select
-            value={robotId}
-            onChange={(e) => setRobotId(e.target.value)}
-            className="w-full p-2 border border-gray-300 rounded-md"
-          >
-            <option value="robot1">Robot 1</option>
-            <option value="robot2">Robot 2</option>
-            <option value="robot3">Robot 3</option>
-            <option value="robot4">Robot 4</option>
-          </select>
-        </div>
-        <div>
-          <label className="block text-sm font-medium text-gray-700 mb-1">Motor</label>
-          <select
-            value={motorId}
-            onChange={(e) => setMotorId(parseInt(e.target.value))}
-            className="w-full p-2 border border-gray-300 rounded-md"
-          >
-            <option value={1}>Motor 1</option>
-            <option value={2}>Motor 2</option>
-            <option value={3}>Motor 3</option>
-          </select>
-        </div>
+      {/* Motor Selection */}
+      <div>
+        <label className="block text-sm font-medium text-gray-700 mb-1">Motor</label>
+        <select
+          value={motorId}
+          onChange={(e) => setMotorId(parseInt(e.target.value))}
+          className="w-full p-2 border border-gray-300 rounded-md"
+        >
+          <option value={1}>Motor 1</option>
+          <option value={2}>Motor 2</option>
+          <option value={3}>Motor 3</option>
+        </select>
       </div>
       
       {/* Slider và Input cho các thông số PID */}
@@ -302,13 +300,13 @@ const PIDControlWidget: React.FC = () => {
       {/* Thông báo trạng thái */}
       {saveStatus === 'success' && (
         <div className="bg-green-100 border border-green-400 text-green-700 px-3 py-2 rounded text-sm flex items-center gap-1">
-          Cấu hình PID đã được gửi thành công đến TCP server!
+          Cấu hình PID đã được gửi thành công!
         </div>
       )}
       
       {saveStatus === 'error' && (
         <div className="bg-red-100 border border-red-400 text-red-700 px-3 py-2 rounded text-sm flex items-center gap-1">
-          Không thể gửi cấu hình PID đến TCP server. Vui lòng thử lại.
+          {errorMessage || "Không thể gửi cấu hình PID. Vui lòng thử lại."}
         </div>
       )}
     </div>
