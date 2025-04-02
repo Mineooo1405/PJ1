@@ -218,15 +218,7 @@ def robot_client(robot_id):
 if __name__ == "__main__":
     robots = ["robot1"]
     threads = []
-    
-    print("===== ROBOT SIMULATOR =====")
-    print("This simulator will:")
-    print("1. Connect to DirectBridge as a robot")
-    print("2. Send periodic encoder and IMU data")
-    print("3. Receive and display PID configurations")
-    print("4. Handle firmware update requests")
-    print("===========================")
-    
+   
     try:
         for robot_id in robots:
             thread = threading.Thread(target=robot_client, args=(robot_id,))
