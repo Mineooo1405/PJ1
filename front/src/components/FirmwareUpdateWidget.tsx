@@ -20,6 +20,25 @@ const FirmwareUpdateWidget: React.FC = () => {
   }, [selectedRobotId]);
 
   useEffect(() => {
+    // Cố gắng kết nối ngay khi component được tạo
+    if (!tcpWebSocketService.isConnected()) {
+      tcpWebSocketService.connect();
+    }
+    
+    // Thêm interval để thử kết nối lại định kỳ
+    const intervalId = setInterval(() => {
+      if (!isConnected) {
+        console.log("Đang thử kết nối lại tới DirectBridge...");
+        tcpWebSocketService.connect();
+      }
+    }, 10000);
+    
+    return () => {
+      clearInterval(intervalId);
+    };
+  }, [isConnected]);
+
+  useEffect(() => {
     const handleConnectionChange = (connected: boolean) => {
       console.log("DirectBridge connection state changed:", connected);
       setIsConnected(connected);

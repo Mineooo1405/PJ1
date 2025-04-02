@@ -58,7 +58,19 @@ def receive_messages(sock, robot_id, stop_event):
                                 "motor_id": message.get("motor_id"),
                                 "timestamp": time.time()
                             }
+                            print(f"Sending PID response: {response}")
                             send_message(sock, response)
+                            
+                            # Gửi thêm một pid_response như DirectBridge mong đợi
+                            response2 = {
+                                "type": "pid_response",
+                                "robot_id": robot_id,
+                                "status": "success",
+                                "message": f"PID config applied to motor {message.get('motor_id')}",
+                                "timestamp": time.time()
+                            }
+                            print(f"Sending additional pid_response: {response2}")
+                            send_message(sock, response2)
                             
                         elif message.get('type') == 'check_firmware_version':
                             print(f"\n==== FIRMWARE VERSION CHECK ====")

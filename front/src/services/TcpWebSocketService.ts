@@ -5,6 +5,8 @@ class TcpWebSocketService {
   private events = new EventEmitter();
   private connecting = false;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private reconnectAttempts = 0;
+  private url = '';
   private robotId = 'robot1';
   
   constructor() {
@@ -17,17 +19,18 @@ class TcpWebSocketService {
     // Reconnect if already connected
     if (this.isConnected()) {
       this.disconnect();
-      this.connect();
+      setTimeout(() => this.connect(), 500);
     }
   }
 
   connect() {
-    // Cancel any pending reconnect
+    // Clear any existing reconnect timer
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
     }
     
+    // If already connected or connecting, do nothing
     if (this.socket && (this.socket.readyState === WebSocket.OPEN || this.socket.readyState === WebSocket.CONNECTING)) {
       console.log('WebSocket is already connected or connecting');
       return;
@@ -46,14 +49,15 @@ class TcpWebSocketService {
       const host = window.location.hostname || 'localhost';
       const port = 9003; // direct_bridge WebSocket port
       
-      const url = `${protocol}//${host}:${port}/ws/${this.robotId}`;
+      this.url = `${protocol}//${host}:${port}/ws/${this.robotId}`;
       
-      console.log(`Connecting to direct_bridge WebSocket at ${url}`);
-      this.socket = new WebSocket(url);
+      console.log(`Connecting to direct_bridge WebSocket at ${this.url}`);
+      this.socket = new WebSocket(this.url);
       
       this.socket.onopen = () => {
         console.log('WebSocket connection to direct_bridge established');
         this.connecting = false;
+        this.reconnectAttempts = 0;
         this.events.emit('connectionChange', true);
         
         // Send identification message
@@ -67,11 +71,11 @@ class TcpWebSocketService {
       this.socket.onclose = (event) => {
         console.log(`WebSocket connection closed: ${event.code} - ${event.reason}`);
         this.connecting = false;
-        this.events.emit('connectionChange', false);
         this.socket = null;
+        this.events.emit('connectionChange', false);
         
-        // Try to reconnect after delay if not manually disconnected
-        if (event.code !== 1000 || event.reason !== 'Closed by client') {
+        // Always try to reconnect unless it was a manual disconnect
+        if (event.reason !== 'Manual disconnect') {
           this.scheduleReconnect();
         }
       };
@@ -81,11 +85,9 @@ class TcpWebSocketService {
         this.connecting = false;
         this.events.emit('connectionChange', false);
         
-        // Socket error typically means we should reconnect
+        // If there's an error, close the socket to trigger reconnect via onclose
         if (this.socket) {
           this.socket.close();
-          this.socket = null;
-          this.scheduleReconnect();
         }
       };
       
@@ -114,14 +116,15 @@ class TcpWebSocketService {
   }
   
   disconnect() {
-    if (this.socket) {
-      this.socket.close(1000, 'Closed by client');
-      this.socket = null;
-    }
-    
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
+    }
+    
+    if (this.socket) {
+      // Use manual disconnect reason to avoid auto reconnect
+      this.socket.close(1000, 'Manual disconnect');
+      this.socket = null;
     }
   }
   
@@ -134,16 +137,22 @@ class TcpWebSocketService {
       clearTimeout(this.reconnectTimer);
     }
     
+    // Exponential backoff with max delay of 30 seconds
+    this.reconnectAttempts++;
+    const delay = Math.min(Math.pow(1.5, Math.min(this.reconnectAttempts, 10)) * 1000, 30000);
+    
+    console.log(`Scheduling reconnect attempt ${this.reconnectAttempts} in ${delay}ms`);
+    
     this.reconnectTimer = setTimeout(() => {
-      console.log('Attempting to reconnect WebSocket...');
+      console.log('Attempting to reconnect...');
       this.connect();
-    }, 2000); // Try after 2 seconds
+    }, delay);
   }
   
   sendMessage(message: any): boolean {
     if (!this.isConnected()) {
       console.error('Cannot send message, WebSocket is not connected');
-      // Try to reconnect if not connected
+      // Try to reconnect
       this.connect();
       return false;
     }
@@ -158,21 +167,20 @@ class TcpWebSocketService {
         message.timestamp = Date.now() / 1000;
       }
       
-      // Log the message being sent
-      console.log('Sending WebSocket message:', message);
+      // Clone the message before stringifying to avoid circular references
+      const messageCopy = JSON.parse(JSON.stringify(message));
       
-      // Send the message
-      this.socket!.send(JSON.stringify(message));
+      this.socket!.send(JSON.stringify(messageCopy));
+      console.log('Sent message:', messageCopy);
       return true;
     } catch (error) {
       console.error('Error sending WebSocket message:', error);
       
-      // If we got an error while sending, the socket might be broken
-      // Schedule a reconnection attempt
+      // If there's an error while sending, the connection might be broken
+      // Close the socket to trigger reconnect
       if (this.socket) {
-        this.socket.close(); // Force close to trigger reconnect
+        this.socket.close();
         this.socket = null;
-        this.scheduleReconnect();
       }
       
       return false;

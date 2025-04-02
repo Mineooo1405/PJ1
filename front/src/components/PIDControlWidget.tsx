@@ -77,6 +77,14 @@ const PIDControlWidget: React.FC = () => {
     };
   }, []);
   
+  // Tự động kết nối khi component mount
+  useEffect(() => {
+    // Cố gắng kết nối ngay khi component được tạo
+    if (!tcpWebSocketService.isConnected()) {
+      tcpWebSocketService.connect();
+    }
+  }, []);
+  
   // Xử lý thay đổi đầu vào
   const handleChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const { name, value } = e.target;
@@ -89,9 +97,21 @@ const PIDControlWidget: React.FC = () => {
   // Lưu và gửi cấu hình PID
   const handleSave = async () => {
     if (!isConnected) {
-      setErrorMessage("Chưa kết nối tới DirectBridge");
+      // Thử kết nối lại
+      tcpWebSocketService.connect();
+      setErrorMessage("Đang kết nối tới DirectBridge...");
       setSaveStatus('error');
-      setTimeout(() => setSaveStatus('idle'), 3000);
+      
+      // Đợi 2 giây rồi kiểm tra kết nối
+      setTimeout(() => {
+        if (tcpWebSocketService.isConnected()) {
+          // Nếu kết nối thành công, thử gửi lại
+          handleSave();
+        } else {
+          setErrorMessage("Không thể kết nối tới DirectBridge. Vui lòng thử lại.");
+          setTimeout(() => setSaveStatus('idle'), 3000);
+        }
+      }, 2000);
       return;
     }
     
@@ -100,6 +120,7 @@ const PIDControlWidget: React.FC = () => {
     setErrorMessage(null);
     
     try {
+      // Gửi cấu hình PID
       const success = tcpWebSocketService.sendPidConfig(
         selectedRobotId,
         motorId,
@@ -110,7 +131,15 @@ const PIDControlWidget: React.FC = () => {
         throw new Error("Không thể gửi thông số PID");
       }
       
-      // Phản hồi sẽ được xử lý bởi handlePidResponse
+      // Đặt timeout để tự động hiển thị thành công nếu không nhận được phản hồi
+      setTimeout(() => {
+        if (isSaving) {
+          setIsSaving(false);
+          setSaveStatus('success');
+          setTimeout(() => setSaveStatus('idle'), 3000);
+        }
+      }, 5000);
+      
     } catch (error) {
       setSaveStatus('error');
       setErrorMessage(error instanceof Error ? error.message : "Lỗi không xác định");

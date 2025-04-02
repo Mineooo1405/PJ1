@@ -182,17 +182,20 @@ class DirectBridge:
                                     await writer.drain()
                                     logger.info(f"Forwarded PID config to {robot_id} TCP")
                                     
-                                    # Send success response back to WebSocket client
+                                    # Send preliminary success response back to WebSocket client
+                                    # This guarantees client gets something even if robot doesn't respond
                                     await websocket.send(json.dumps({
                                         "type": "pid_response",
-                                        "status": "success",
+                                        "status": "processing",
                                         "robot_id": robot_id,
-                                        "message": "PID configuration sent to robot",
+                                        "message": "PID configuration sent to robot, awaiting confirmation",
                                         "timestamp": time.time()
                                     }))
                                 except Exception as e:
                                     logger.error(f"Error sending PID config to TCP {robot_id}: {str(e)}")
-                                    # Send error response back to WebSocket client
+                                    
+                                    # Even in case of error, don't close the WebSocket connection
+                                    # Just send error response back to WebSocket client
                                     await websocket.send(json.dumps({
                                         "type": "pid_response",
                                         "status": "error",
