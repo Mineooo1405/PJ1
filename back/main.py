@@ -23,6 +23,25 @@ from sqlalchemy import create_engine, Column, Integer, Float, String, Boolean, D
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.dialects.postgresql import JSONB
 from robot_database import Base
+from data_buffer_service import buffer_service
+import aiohttp
+
+# Thêm kết nối đến SQLite database
+import sqlite3
+from contextlib import contextmanager
+
+# Đường dẫn đến file database
+SQLITE_DB_PATH = './robot_data.db'
+
+@contextmanager
+def get_sqlite_connection():
+    """Context manager for SQLite database connection"""
+    conn = sqlite3.connect(SQLITE_DB_PATH)
+    conn.row_factory = sqlite3.Row  # Get rows as dictionaries
+    try:
+        yield conn
+    finally:
+        conn.close()
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("websocket")
@@ -64,6 +83,9 @@ from contextlib import asynccontextmanager
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Start buffer service
+    await buffer_service.start()
+    
     # Start background tasks
     encoder_task = asyncio.create_task(broadcast_encoder_updates())
     imu_task = asyncio.create_task(broadcast_imu_updates())
@@ -71,10 +93,11 @@ async def lifespan(app: FastAPI):
     print("Background tasks started")
     yield
     
-    # Clean up background tasks
+    # Clean up
     encoder_task.cancel()
     imu_task.cancel()
-    print("Background tasks cancelled")
+    await buffer_service.stop()
+    print("Background tasks and buffer service stopped")
 
 # Create FastAPI app with the lifespan handler
 app = FastAPI(lifespan=lifespan)
@@ -268,6 +291,41 @@ async def robot_endpoint(websocket: WebSocket, robot_id: str):
     # Handle specialized endpoints with parameter
     robot_id = ConnectionManager.normalize_robot_id(robot_id)
     await handle_robot_connection(websocket, robot_id)
+
+@app.websocket("/ws/{robot_id}/encoder")
+async def websocket_encoder_endpoint(websocket: WebSocket, robot_id: str):
+    await websocket.accept()
+    try:
+        # Lấy dữ liệu encoder mới nhất từ SQLite
+        with get_sqlite_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT * FROM encoder_data WHERE robot_id = ? ORDER BY timestamp DESC LIMIT 10",
+                (robot_id,)
+            )
+            rows = cursor.fetchall()
+            
+            # Gửi dữ liệu qua WebSocket
+            for row in rows:
+                # Parse raw_data JSON
+                raw_data = json.loads(row['raw_data'])
+                await websocket.send_json({
+                    "type": "encoder_data",
+                    "robot_id": row['robot_id'],
+                    "rpm1": row['rpm_1'],
+                    "rpm2": row['rpm_2'],
+                    "rpm3": row['rpm_3'],
+                    "timestamp": row['timestamp'],
+                    "raw_data": raw_data
+                })
+                
+        # Thiết lập mô hình subscribe
+        while True:
+            data = await websocket.receive_text()
+            # Process commands if needed
+    except WebSocketDisconnect:
+        # Handle disconnect
+        pass
 
 # Send robot data from database when connected
 async def send_dummy_robot_data(ws: WebSocket, robot_id: str):
@@ -637,85 +695,10 @@ async def process_robot_command(robot_id: str, data: dict, ws: WebSocket):
             await handle_unsubscribe_encoder(ws, robot_id)
 
         elif command_type == "get_encoder_data_since":
-            try:
-                # Convert timestamp to datetime
-                since_timestamp = data.get("since", 0)
-                since_time = datetime.fromtimestamp(float(since_timestamp))
-                print(f"Fetching encoder data since {since_time}")
-                
-                # Get encoder data since specified timestamp
-                query = db.query(EncoderData).filter(
-                    EncoderData.robot_id == robot_id,
-                    EncoderData.timestamp > since_time
-                ).order_by(EncoderData.timestamp.asc())
-                
-                results = query.all()
-                
-                if results:
-                    print(f"Found {len(results)} new encoder records since {since_time}")
-                    for encoder in results:
-                        # Send each encoder data record
-                        await ws.send_json({
-                            "type": "encoder_data",
-                            "robot_id": robot_id,
-                            "rpm1": encoder.rpm_1,  # Converting from rpm_1 to rpm1 for frontend
-                            "rpm2": encoder.rpm_2,
-                            "rpm3": encoder.rpm_3,
-                            "timestamp": encoder.timestamp.timestamp()
-                        })
-                else:
-                    await ws.send_json({
-                        "type": "info",
-                        "message": f"No new encoder data since {since_time}"
-                    })
-            except Exception as e:
-                logging.error(f"Error getting encoder data since timestamp: {e}")
-                await ws.send_json({
-                    "type": "error",
-                    "message": f"Error getting data: {str(e)}"
-                })
+            await handle_get_encoder_data_since(ws, robot_id, data)
 
         elif command_type == "get_imu_data_since":
-            try:
-                # Convert timestamp to datetime
-                since_timestamp = data.get("since", 0)
-                since_time = datetime.fromtimestamp(float(since_timestamp))
-                print(f"Fetching IMU data since {since_time}")
-                
-                # Get IMU data since specified timestamp
-                query = db.query(IMUData).filter(
-                    IMUData.robot_id == robot_id,
-                    IMUData.timestamp > since_time
-                ).order_by(IMUData.timestamp.asc()).limit(50)
-                
-                results = query.all()
-                
-                if results:
-                    print(f"Found {len(results)} new IMU records since {since_time}")
-                    for imu in results:
-                        await ws.send_json({
-                            "type": "imu_data",
-                            "robot_id": robot_id,
-                            "roll": imu.roll,
-                            "pitch": imu.pitch,
-                            "yaw": imu.yaw,
-                            "qw": imu.quat_w,
-                            "qx": imu.quat_x,
-                            "qy": imu.quat_y,
-                            "qz": imu.quat_z,
-                            "timestamp": imu.timestamp.timestamp()
-                        })
-                else:
-                    await ws.send_json({
-                        "type": "info",
-                        "message": f"No new IMU data since {since_time}"
-                    })
-            except Exception as e:
-                logging.error(f"Error getting IMU data since timestamp: {e}")
-                await ws.send_json({
-                    "type": "error",
-                    "message": f"Error getting data: {str(e)}"
-                })
+            await handle_get_imu_data_since(ws, robot_id, data)
 
         # Các lệnh không xử lý được
         else:
@@ -810,42 +793,20 @@ async def receive_robot_data(data: dict):
         
         # Process based on message type
         message_type = data.get("type", "unknown")
-        logger.info(f"Received {message_type} data from {robot_id}")
         
-        # Create database session
-        db = SessionLocal()
-        try:
-            # Store in appropriate table based on data type
-            if message_type == "encoder":
-                # Process encoder data
-                encoder_data = EncoderData(
-                    robot_id=robot_id,
-                    rpm_1=data.get("rpm1", 0),
-                    rpm_2=data.get("rpm2", 0),
-                    rpm_3=data.get("rpm3", 0),
-                    raw_data=data,
-                    timestamp=datetime.fromtimestamp(data.get("timestamp", time.time()))
-                )
-                db.add(encoder_data)
+        # Instead of immediately writing to database, add to buffer
+        if message_type == "encoder":
+            # Add to encoder buffer
+            await buffer_service.add_encoder_data(data)
                 
-            elif message_type == "imu":
-                # Process IMU data
-                imu_data = IMUData(
-                    robot_id=robot_id,
-                    roll=data.get("roll", 0),
-                    pitch=data.get("pitch", 0),
-                    yaw=data.get("yaw", 0),
-                    quat_w=data.get("qw", 1),
-                    quat_x=data.get("qx", 0),
-                    quat_y=data.get("qy", 0),
-                    quat_z=data.get("qz", 0),
-                    raw_data=data,
-                    timestamp=datetime.fromtimestamp(data.get("timestamp", time.time()))
-                )
-                db.add(imu_data)
+        elif message_type == "imu":
+            # Add to IMU buffer
+            await buffer_service.add_imu_data(data)
                 
-            elif message_type in ["heartbeat", "status"]:
-                # Just update robot status in database
+        elif message_type in ["heartbeat", "status"]:
+            # Still update robot status in database immediately - this is low frequency
+            db = SessionLocal()
+            try:
                 robot = db.query(Robot).filter(Robot.robot_id == robot_id).first()
                 if robot:
                     robot.last_seen = datetime.now()
@@ -862,53 +823,64 @@ async def receive_robot_data(data: dict):
                     )
                     db.add(robot)
                 
-            else:
-                # Store as general log
-                log_data = LogData(
-                    robot_id=robot_id,
-                    log_level="INFO",
-                    message=f"Data: {message_type}",
-                    raw_data=data,
-                    timestamp=datetime.fromtimestamp(data.get("timestamp", time.time()))
-                )
-                db.add(log_data)
+                db.commit()
+            finally:
+                db.close()
                 
-            db.commit()
-            
-            # Try to update any connected websockets with this new data
-            try:
-                for ws in ConnectionManager.get_websockets(robot_id):
-                    # If the websocket has subscribed to this data type, send an update
-                    if message_type == "imu" and getattr(ws, "subscribe_imu", False):
-                        await ws.send_json({
-                            "type": "imu_update",
-                            "robot_id": robot_id,
-                            "data": data,
-                            "timestamp": time.time()
-                        })
-                    if message_type == "encoder" and getattr(ws, "subscribe_encoder", False):
-                        await ws.send_json({
-                            "type": "encoder_update",
-                            "robot_id": robot_id,
-                            "data": data,
-                            "timestamp": time.time()
-                        })
-            except Exception as ws_err:
-                logger.error(f"Error updating websockets: {str(ws_err)}")
+        else:
+            # Add as general log
+            await buffer_service.add_log_data({
+                "robot_id": robot_id,
+                "log_level": "INFO",
+                "message": f"Data: {message_type}",
+                "raw_data": data,
+                "timestamp": data.get("timestamp", time.time())
+            })
                 
-            return {
-                "status": "success", 
-                "message": f"Stored {message_type} data for {robot_id}",
-                "timestamp": time.time()
-            }
-            
-        finally:
-            db.close()
+        # Try to update any connected websockets with this new data
+        try:
+            for ws in ConnectionManager.get_websockets(robot_id):
+                # If the websocket has subscribed to this data type, send an update
+                if message_type == "imu" and getattr(ws, "subscribe_imu", False):
+                    await ws.send_json({
+                        "type": "imu_update",
+                        "robot_id": robot_id,
+                        "data": data,
+                        "timestamp": time.time()
+                    })
+                if message_type == "encoder" and getattr(ws, "subscribe_encoder", False):
+                    await ws.send_json({
+                        "type": "encoder_update",
+                        "robot_id": robot_id,
+                        "data": data,
+                        "timestamp": time.time()
+                    })
+        except Exception as ws_err:
+            logger.error(f"Error updating websockets: {str(ws_err)}")
+                
+        return {
+            "status": "success", 
+            "message": f"Processed {message_type} data for {robot_id}",
+            "timestamp": time.time()
+        }
             
     except Exception as e:
         logger.error(f"Error processing robot data: {str(e)}")
         logger.error(traceback.format_exc())
         return {"status": "error", "message": str(e)}
+
+@app.get("/api/db-stats")
+async def get_db_stats():
+    """Get database performance statistics"""
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get('http://localhost:9003/db-stats') as response:
+                if response.status == 200:
+                    return await response.json()
+                else:
+                    return {"error": "Could not get database statistics"}
+    except Exception as e:
+        return {"error": str(e)}
 
 async def get_robot_status_data(robot_id: str, db: Session = None):
     """Centralized function for getting robot status data from DB"""
@@ -1122,6 +1094,47 @@ async def handle_get_encoder_data(websocket: WebSocket, robot_id: str, db: Sessi
             "message": f"Error retrieving encoder data: {str(e)}"
         })
 
+async def handle_get_encoder_data_since(websocket: WebSocket, robot_id: str, message: dict):
+    try:
+        # Convert timestamp to datetime
+        since_timestamp = message.get("since", 0)
+        since_time = datetime.fromtimestamp(float(since_timestamp))
+        logging.info(f"Fetching encoder data since {since_time} for {robot_id}")
+        
+        # Use SQLite connection
+        with get_sqlite_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT * FROM encoder_data WHERE robot_id = ? AND timestamp > ? ORDER BY timestamp ASC LIMIT 100",
+                (robot_id, since_time.isoformat())
+            )
+            rows = cursor.fetchall()
+            
+            if rows:
+                logging.info(f"Found {len(rows)} encoder records since {since_time}")
+                for row in rows:
+                    await websocket.send_json({
+                        "type": "encoder_data",
+                        "robot_id": robot_id,
+                        "rpm_1": row["rpm_1"],
+                        "rpm_2": row["rpm_2"],
+                        "rpm_3": row["rpm_3"],
+                        "timestamp": datetime.fromisoformat(row["timestamp"]).timestamp()
+                    })
+            else:
+                logging.info(f"No encoder data found since {since_time}")
+                await websocket.send_json({
+                    "type": "info",
+                    "message": f"No new encoder data since {since_time}"
+                })
+                
+    except Exception as e:
+        logging.error(f"Error getting encoder data: {e}")
+        await websocket.send_json({
+            "type": "error",
+            "message": f"Error retrieving encoder data: {str(e)}"
+        })
+
 async def handle_subscribe_encoder(websocket: WebSocket, robot_id: str):
     """Subscribe to encoder data updates for a specific robot"""
     if robot_id not in encoder_subscribers:
@@ -1148,117 +1161,139 @@ async def handle_unsubscribe_encoder(websocket: WebSocket, robot_id: str):
         "message": f"Unsubscribed from encoder updates for {robot_id}"
     })
 
+async def handle_get_imu_data_since(websocket: WebSocket, robot_id: str, message: dict):
+    try:
+        # Convert timestamp to datetime
+        since_timestamp = message.get("since", 0)
+        since_time = datetime.fromtimestamp(float(since_timestamp))
+        logging.info(f"Fetching IMU data since {since_time} for {robot_id}")
+        
+        # Use SQLite connection
+        with get_sqlite_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT * FROM imu_data WHERE robot_id = ? AND timestamp > ? ORDER BY timestamp ASC LIMIT 100",
+                (robot_id, since_time.isoformat())
+            )
+            rows = cursor.fetchall()
+            
+            if rows:
+                logging.info(f"Found {len(rows)} IMU records since {since_time}")
+                for row in rows:
+                    await websocket.send_json({
+                        "type": "imu_data",
+                        "robot_id": robot_id,
+                        "roll": row["roll"],
+                        "pitch": row["pitch"],
+                        "yaw": row["yaw"],
+                        "qw": row["quat_w"], 
+                        "qx": row["quat_x"],
+                        "qy": row["quat_y"],
+                        "qz": row["quat_z"],
+                        "timestamp": datetime.fromisoformat(row["timestamp"]).timestamp()
+                    })
+            else:
+                logging.info(f"No IMU data found since {since_time}")
+                await websocket.send_json({
+                    "type": "info",
+                    "message": f"No new IMU data since {since_time}"
+                })
+                
+    except Exception as e:
+        logging.error(f"Error getting IMU data: {e}")
+        await websocket.send_json({
+            "type": "error",
+            "message": f"Error retrieving IMU data: {str(e)}"
+        })
+
 async def broadcast_imu_updates():
     """Periodically broadcast IMU updates to subscribers"""
     while True:
-        await asyncio.sleep(1)  # Update every second
-        
-        # Only proceed if we have subscribers
-        if not imu_subscribers:
-            continue
-        
-        # Get database session
-        db = SessionLocal()
-        
         try:
-            # For each robot with subscribers
             for robot_id, subscribers in imu_subscribers.items():
                 if not subscribers:
                     continue
                 
-                # Get latest IMU data
-                latest_imu = db.query(IMUData).filter(
-                    IMUData.robot_id == robot_id
-                ).order_by(desc(IMUData.timestamp)).first()
-                
-                if latest_imu:
-                    # Prepare message
-                    message = {
-                        "type": "imu_data",
-                        "robot_id": robot_id,
-                        "roll": latest_imu.roll,
-                        "pitch": latest_imu.pitch,
-                        "yaw": latest_imu.yaw,
-                        "quat_w": latest_imu.quat_w,
-                        "quat_x": latest_imu.quat_x,
-                        "quat_y": latest_imu.quat_y,
-                        "quat_z": latest_imu.quat_z,
-                        "timestamp": latest_imu.timestamp.timestamp()
-                    }
+                # Use SQLite to get latest IMU data
+                with get_sqlite_connection() as conn:
+                    cursor = conn.cursor()
+                    cursor.execute(
+                        "SELECT * FROM imu_data WHERE robot_id = ? ORDER BY timestamp DESC LIMIT 1",
+                        (robot_id,)
+                    )
+                    row = cursor.fetchone()
                     
-                    # Send to all subscribers
-                    disconnected = set()
-                    for websocket in subscribers:
-                        try:
-                            await websocket.send_json(message)
-                        except Exception:
-                            # Mark for removal if sending fails
-                            disconnected.add(websocket)
-                    
-                    # Remove disconnected clients
-                    for websocket in disconnected:
-                        if websocket in subscribers:
-                            subscribers.remove(websocket)
+                    if row:
+                        message = {
+                            "type": "imu_data",
+                            "robot_id": robot_id,
+                            "roll": row["roll"],
+                            "pitch": row["pitch"],
+                            "yaw": row["yaw"],
+                            "quat_w": row["quat_w"],
+                            "quat_x": row["quat_x"],
+                            "quat_y": row["quat_y"],
+                            "quat_z": row["quat_z"],
+                            "timestamp": datetime.fromisoformat(row["timestamp"]).timestamp()
+                        }
+                        
+                        # Send to all subscribers
+                        for websocket in list(subscribers):
+                            try:
+                                await websocket.send_json(message)
+                            except Exception as e:
+                                logging.error(f"Error sending IMU update to client: {e}")
+                                # Remove problematic subscriber
+                                subscribers.remove(websocket)
+            
+            # Sleep before next broadcast - shorter interval for better responsiveness
+            await asyncio.sleep(0.1)
         
         except Exception as e:
-            logging.error(f"Error in broadcast_imu_updates: {str(e)}")
-        
-        finally:
-            db.close()
+            logging.error(f"Error in IMU broadcast: {e}")
+            await asyncio.sleep(1.0)  # Sleep longer on error
 
-# Complete the broadcast_encoder_updates function
 async def broadcast_encoder_updates():
     """Periodically broadcast encoder updates to subscribers"""
     while True:
-        await asyncio.sleep(1)  # Update every second
-        
-        # Only proceed if we have subscribers
-        if not encoder_subscribers:
-            continue
-        
-        # Get database session
-        db = SessionLocal()
-        
         try:
-            # For each robot with subscribers
             for robot_id, subscribers in encoder_subscribers.items():
                 if not subscribers:
-                    continue  # Skip if no subscribers
-                
-                # Get latest encoder data
-                latest_encoder = db.query(EncoderData).filter(
-                    EncoderData.robot_id == robot_id
-                ).order_by(desc(EncoderData.timestamp)).first()
-                
-                if latest_encoder:
-                    # Create message to broadcast
-                    message = {
-                        "type": "encoder_data",
-                        "robot_id": robot_id,
-                        "rpm1": latest_encoder.rpm_1,  # Note field name conversion
-                        "rpm2": latest_encoder.rpm_2,
-                        "rpm3": latest_encoder.rpm_3,
-                        "timestamp": latest_encoder.timestamp.timestamp()
-                    }
+                    continue
                     
-                    # Send to all subscribers
-                    disconnected = set()
-                    for ws in subscribers:
-                        try:
-                            await ws.send_json(message)
-                        except Exception as e:
-                            logging.error(f"Error sending to subscriber: {str(e)}")
-                            disconnected.add(ws)
+                # Use SQLite to get latest encoder data
+                with get_sqlite_connection() as conn:
+                    cursor = conn.cursor()
+                    cursor.execute(
+                        "SELECT * FROM encoder_data WHERE robot_id = ? ORDER BY timestamp DESC LIMIT 1",
+                        (robot_id,)
+                    )
+                    row = cursor.fetchone()
                     
-                    # Remove disconnected clients
-                    for ws in disconnected:
-                        subscribers.remove(ws)
-        
+                    if row:
+                        data = {
+                            "type": "encoder_data",
+                            "robot_id": robot_id,
+                            "rpm_1": row["rpm_1"],
+                            "rpm_2": row["rpm_2"],
+                            "rpm_3": row["rpm_3"],
+                            "timestamp": datetime.fromisoformat(row["timestamp"]).timestamp()
+                        }
+                        
+                        # Send to all subscribers
+                        for ws in list(subscribers):
+                            try:
+                                await ws.send_json(data)
+                            except Exception as e:
+                                logging.error(f"Error sending encoder data to subscriber: {e}")
+                                # Remove problematic subscriber
+                                subscribers.remove(ws)
+            
+            # Sleep before next broadcast
+            await asyncio.sleep(0.1)
         except Exception as e:
-            logging.error(f"Error in broadcast_encoder_updates: {str(e)}")
-        
-        finally:
-            db.close()
+            logging.error(f"Error in encoder broadcast: {e}")
+            await asyncio.sleep(1.0)
 
 async def process_websocket_message(websocket: WebSocket, data: str, robot_id: str, db: Session):
     try:
@@ -1288,85 +1323,10 @@ async def process_websocket_message(websocket: WebSocket, data: str, robot_id: s
             await handle_get_pid_data(websocket, robot_id, db)
         
         elif message_type == "get_encoder_data_since":
-            try:
-                # Convert timestamp to datetime
-                since_timestamp = message.get("since", 0)
-                since_time = datetime.fromtimestamp(float(since_timestamp))
-                print(f"Fetching encoder data since {since_time}")
-                
-                # Get encoder data since specified timestamp
-                query = db.query(EncoderData).filter(
-                    EncoderData.robot_id == robot_id,
-                    EncoderData.timestamp > since_time
-                ).order_by(EncoderData.timestamp.asc())
-                
-                results = query.all()
-                
-                if results:
-                    print(f"Found {len(results)} new encoder records since {since_time}")
-                    for encoder in results:
-                        # Send each encoder data record
-                        await websocket.send_json({
-                            "type": "encoder_data",
-                            "robot_id": robot_id,
-                            "rpm1": encoder.rpm_1,  # Converting from rpm_1 to rpm1 for frontend
-                            "rpm2": encoder.rpm_2,
-                            "rpm3": encoder.rpm_3,
-                            "timestamp": encoder.timestamp.timestamp()
-                        })
-                else:
-                    await websocket.send_json({
-                        "type": "info",
-                        "message": f"No new encoder data since {since_time}"
-                    })
-            except Exception as e:
-                logging.error(f"Error getting encoder data since timestamp: {e}")
-                await websocket.send_json({
-                    "type": "error",
-                    "message": f"Error getting data: {str(e)}"
-                })
+            await handle_get_encoder_data_since(websocket, robot_id, message)
         
         elif message_type == "get_imu_data_since":
-            try:
-                # Convert timestamp to datetime
-                since_timestamp = message.get("since", 0)
-                since_time = datetime.fromtimestamp(float(since_timestamp))
-                print(f"Fetching IMU data since {since_time}")
-                
-                # Get IMU data since specified timestamp
-                query = db.query(IMUData).filter(
-                    IMUData.robot_id == robot_id,
-                    IMUData.timestamp > since_time
-                ).order_by(IMUData.timestamp.asc()).limit(50)
-                
-                results = query.all()
-                
-                if results:
-                    print(f"Found {len(results)} new IMU records since {since_time}")
-                    for imu in results:
-                        await websocket.send_json({
-                            "type": "imu_data",
-                            "robot_id": robot_id,
-                            "roll": imu.roll,
-                            "pitch": imu.pitch,
-                            "yaw": imu.yaw,
-                            "qw": imu.quat_w,
-                            "qx": imu.quat_x,
-                            "qy": imu.quat_y,
-                            "qz": imu.quat_z,
-                            "timestamp": imu.timestamp.timestamp()
-                        })
-                else:
-                    await websocket.send_json({
-                        "type": "info",
-                        "message": f"No new IMU data since {since_time}"
-                    })
-            except Exception as e:
-                logging.error(f"Error getting IMU data since timestamp: {e}")
-                await websocket.send_json({
-                    "type": "error",
-                    "message": f"Error getting data: {str(e)}"
-                })
+            await handle_get_imu_data_since(websocket, robot_id, message)
             
         # Add any other message types you need to handle
             
@@ -1376,6 +1336,125 @@ async def process_websocket_message(websocket: WebSocket, data: str, robot_id: s
             "type": "error",
             "message": f"Error processing message: {str(e)}"
         })
+
+@app.get("/api/encoder-data/{robot_id}")
+async def get_encoder_data(robot_id: str, limit: int = 100, downsample: int = 1):
+    """Get encoder data with optional downsampling"""
+    try:
+        with get_sqlite_connection() as conn:
+            cursor = conn.cursor()
+            
+            if downsample <= 1:
+                # No downsampling
+                cursor.execute(
+                    "SELECT * FROM encoder_data WHERE robot_id = ? ORDER BY timestamp DESC LIMIT ?",
+                    (robot_id, limit)
+                )
+            else:
+                # With downsampling - use modulo on rowid
+                cursor.execute("""
+                    SELECT * FROM encoder_data 
+                    WHERE robot_id = ? AND (id % ?) = 0
+                    ORDER BY timestamp DESC LIMIT ?
+                """, (robot_id, downsample, limit))
+                
+            rows = cursor.fetchall()
+            
+            result = []
+            for row in rows:
+                result.append({
+                    "id": row['id'],
+                    "robot_id": row['robot_id'],
+                    "rpm1": row['rpm_1'],
+                    "rpm2": row['rpm_2'],
+                    "rpm3": row['rpm_3'],
+                    "timestamp": row['timestamp']
+                })
+            
+            return {"data": result, "count": len(result)}
+    except Exception as e:
+        logger.error(f"Error getting encoder data: {e}")
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+
+@app.get("/api/debug/database-content")
+async def get_database_content(table: str = "encoder_data", limit: int = 10):
+    """Debug endpoint to directly view raw database content"""
+    try:
+        with sqlite3.connect(SQLITE_DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            
+            # Verify table exists
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            tables = [row['name'] for row in cursor.fetchall()]
+            
+            if table not in tables:
+                return {
+                    "status": "error",
+                    "message": f"Table '{table}' not found. Available tables: {tables}"
+                }
+            
+            # Get table schema
+            cursor.execute(f"PRAGMA table_info({table})")
+            schema = [dict(row) for row in cursor.fetchall()]
+            
+            # Get content
+            cursor.execute(f"SELECT * FROM {table} ORDER BY id DESC LIMIT {limit}")
+            rows = cursor.fetchall()
+            content = [dict(row) for row in rows]
+            
+            return {
+                "status": "success",
+                "table": table,
+                "schema": schema,
+                "row_count": len(content),
+                "sample_data": content
+            }
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+async def get_imu_data_since_timestamp(robot_id: str, since_timestamp: float):
+    """Get IMU data since timestamp - compatible with both SQLite and SQLAlchemy"""
+    try:
+        # First try with direct SQLite query
+        with get_sqlite_connection() as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            since_time_iso = datetime.fromtimestamp(since_timestamp).isoformat()
+            
+            # Note: Using string comparison for timestamp as it's stored as ISO string
+            cursor.execute(
+                "SELECT * FROM imu_data WHERE robot_id = ? AND timestamp > ? ORDER BY timestamp ASC LIMIT 50",
+                (robot_id, since_time_iso)
+            )
+            results = cursor.fetchall()
+            
+            if results:
+                print(f"Found {len(results)} IMU records via SQLite direct query")
+                return [dict(row) for row in results]
+            else:
+                print("No IMU data found via SQLite direct query")
+                return []
+    except Exception as e:
+        print(f"SQLite query error: {e}")
+        # Fall back to SQLAlchemy
+        try:
+            db = SessionLocal()
+            try:
+                since_time = datetime.fromtimestamp(since_timestamp)
+                results = db.query(IMUData).filter(
+                    IMUData.robot_id == robot_id
+                ).order_by(IMUData.timestamp.desc()).limit(50).all()
+                
+                if results:
+                    print(f"Found {len(results)} IMU records via SQLAlchemy fallback")
+                    return results
+                return []
+            finally:
+                db.close()
+        except Exception as e2:
+            print(f"SQLAlchemy fallback error: {e2}")
+            return []
 
 if __name__ == "__main__":
     import uvicorn

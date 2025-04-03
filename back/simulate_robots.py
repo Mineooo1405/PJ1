@@ -174,35 +174,50 @@ def robot_client(robot_id):
         
         # Main loop - send data periodically
         try:
+            # Keep track of last send times to maintain stable frequency
+            last_encoder_send = time.time()
+            last_imu_send = time.time()
+            
+            # Target frequencies
+            encoder_interval = 0.020  # 50Hz (every 20ms)
+            imu_interval = 0.050      # 20Hz (every 50ms)
+            
             while not stop_event.is_set():
-                # Send encoder data
-                encoder_data = {
-                    "type": "encoder",
-                    "robot_id": robot_id,
-                    "rpm1": random.uniform(-30, 30),
-                    "rpm2": random.uniform(-30, 30),
-                    "rpm3": random.uniform(-30, 30),
-                    "timestamp": time.time()
-                }
-                send_message(sock, encoder_data)
-                time.sleep(10)  # Reduced time to make testing faster
-
-                # Send IMU data
-                imu_data = {
-                    "type": "imu",
-                    "robot_id": robot_id,
-                    "roll": random.uniform(-0.5, 0.5),
-                    "pitch": random.uniform(-0.3, 0.3),
-                    "yaw": random.uniform(-3.14, 3.14),
-                    "qw": 1.0,
-                    "qx": 0.0,
-                    "qy": 0.0,
-                    "qz": 0.0,
-                    "timestamp": time.time()
-                }
-                send_message(sock, imu_data)
-
-                time.sleep(10)  # Reduced time to make testing faster
+                current_time = time.time()
+                
+                # Send encoder data at target frequency
+                if current_time - last_encoder_send >= encoder_interval:
+                    encoder_data = {
+                        "type": "encoder",
+                        "robot_id": robot_id,
+                        "rpm1": random.uniform(-30, 30),
+                        "rpm2": random.uniform(-30, 30),
+                        "rpm3": random.uniform(-30, 30),
+                        "timestamp": current_time
+                    }
+                    send_message(sock, encoder_data)
+                    last_encoder_send = current_time
+                
+                # Send IMU data at target frequency
+                if current_time - last_imu_send >= imu_interval:
+                    imu_data = {
+                        "type": "imu",
+                        "robot_id": robot_id,
+                        "roll": random.uniform(-0.5, 0.5),
+                        "pitch": random.uniform(-0.3, 0.3),
+                        "yaw": random.uniform(-3.14, 3.14),
+                        "qw": 1.0,
+                        "qx": 0.0,
+                        "qy": 0.0,
+                        "qz": 0.0,
+                        "timestamp": current_time
+                    }
+                    send_message(sock, imu_data)
+                    last_imu_send = current_time
+                
+                # Sleep a short time to avoid CPU spinning
+                time.sleep(0.001)
+                
         except KeyboardInterrupt:
             print(f"{robot_id}: Closing connection...")
         finally:

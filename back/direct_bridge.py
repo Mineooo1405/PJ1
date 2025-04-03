@@ -8,6 +8,9 @@ from connection_manager import ConnectionManager
 import aiohttp
 import time
 from datetime import datetime
+from high_performance_db import db_writer
+from aiohttp import web
+
 # Configure logging
 logging.basicConfig(
     level=logging.DEBUG,
@@ -18,6 +21,92 @@ logger = logging.getLogger("direct_bridge")
 # Đọc cấu hình port từ biến môi trường hoặc sử dụng mặc định
 TCP_PORT = int(os.environ.get("TCP_PORT", "9000"))
 WS_PORT = int(os.environ.get("WS_BRIDGE_PORT", "9003"))
+
+class APIBatchSender:
+    def __init__(self, batch_size=10, max_wait_time=0.5):
+        self.batch_size = batch_size
+        self.max_wait_time = max_wait_time
+        self.data_batch = []
+        self.last_send_time = time.time()
+        self.lock = asyncio.Lock()
+        self._running = False
+        self.sender_task = None
+        
+    async def start(self):
+        """Start the batch sender"""
+        self._running = True
+        self.sender_task = asyncio.create_task(self._periodic_send())
+        logger.info(f"API Batch sender started")
+    
+    async def stop(self):
+        """Stop the batch sender and send any remaining data"""
+        self._running = False
+        if self.sender_task:
+            self.sender_task.cancel()
+            try:
+                await self.sender_task
+            except asyncio.CancelledError:
+                pass
+        
+        # Send any remaining data
+        await self._send_batch()
+        logger.info("API Batch sender stopped")
+    
+    async def add_data(self, data):
+        """Add data to the batch"""
+        async with self.lock:
+            self.data_batch.append(data)
+            
+        # Auto-send if batch is full
+        if len(self.data_batch) >= self.batch_size:
+            await self._send_batch()
+    
+    async def _periodic_send(self):
+        """Periodically send batched data"""
+        try:
+            while self._running:
+                current_time = time.time()
+                # Send if enough time has passed since last send
+                if current_time - self.last_send_time >= self.max_wait_time:
+                    await self._send_batch()
+                
+                # Wait a short time before checking again
+                await asyncio.sleep(0.1)
+        except asyncio.CancelledError:
+            logger.info("API Batch sender task cancelled")
+            raise
+        except Exception as e:
+            logger.error(f"Error in periodic send: {e}")
+    
+    async def _send_batch(self):
+        """Send the current batch of data to the API endpoint"""
+        data_to_send = []
+        
+        async with self.lock:
+            if not self.data_batch:
+                return
+            
+            data_to_send = self.data_batch.copy()
+            self.data_batch.clear()
+            self.last_send_time = time.time()
+        
+        if data_to_send:
+            try:
+                for data in data_to_send:
+                    # Send each data item to the API
+                    async with aiohttp.ClientSession() as session:
+                        async with session.post(
+                            'http://localhost:8000/api/robot-data',
+                            json=data,
+                            headers={'Content-Type': 'application/json'}
+                        ) as response:
+                            if response.status != 200:
+                                response_text = await response.text()
+                                logger.warning(f"API returned non-200 status: {response.status}, {response_text}")
+                
+                logger.debug(f"Sent batch of {len(data_to_send)} items to API")
+            except Exception as e:
+                logger.error(f"Error sending batch to API: {e}")
 
 class DirectBridge:
     def __init__(self, tcp_port=TCP_PORT, ws_port=WS_PORT):
@@ -122,8 +211,26 @@ class DirectBridge:
                     else:
                         logger.warning(f"No WebSocket clients to forward message to")
                     
-                    # Forward to backend API
-                    await self.forward_to_backend(message, robot_id)
+                    # Handle data based on type
+                    data_type = message.get("type")
+                    if data_type == "encoder":
+                        db_writer.enqueue_data("encoder", message)
+                    elif data_type == "imu":
+                        db_writer.enqueue_data("imu", message)
+                    elif data_type in ["heartbeat", "status"]:
+                        # Heartbeats và status vẫn có thể gửi qua API
+                        async with aiohttp.ClientSession() as session:
+                            try:
+                                async with session.post(
+                                    'http://localhost:8000/api/robot-data',
+                                    json=message,
+                                    headers={'Content-Type': 'application/json'}
+                                ) as response:
+                                    if response.status != 200:
+                                        response_text = await response.text()
+                                        logger.warning(f"API returned non-200 status: {response.status}, {response_text}")
+                            except Exception as e:
+                                logger.error(f"Error sending data to API: {e}")
 
                 except json.JSONDecodeError:
                     logger.error(f"Invalid JSON from {robot_id}: {raw_data.decode()}")
@@ -316,53 +423,44 @@ class DirectBridge:
             ConnectionManager.remove_websocket(robot_id, websocket)
             logger.info(f"WebSocket connection closed for {websocket.remote_address}")
 
-    async def forward_to_backend(self, message, robot_id):
-        """Forward robot data from TCP server to FastAPI backend"""
-        try:
-            # Get backend URL from environment variable or use default
-            backend_url = os.environ.get("BACKEND_URL", "http://localhost:8000")
-            endpoint = f"{backend_url}/api/robot-data"
-            
-            # Add metadata if not present
-            if "timestamp" not in message:
-                message["timestamp"] = time.time()
-                
-            if "robot_id" not in message:
-                message["robot_id"] = robot_id
-                
-            logger.info(f"Forwarding {message.get('type', 'unknown')} data from robot {robot_id} to backend")
-            
-            # Send HTTP POST request to backend
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    endpoint,
-                    json=message,
-                    headers={"Content-Type": "application/json"}
-                ) as response:
-                    if response.status == 200:
-                        response_data = await response.json()
-                        logger.debug(f"Backend response for {robot_id}: {response_data}")
-                        return True
-                    else:
-                        response_text = await response.text()
-                        logger.warning(f"Backend responded with status {response.status}: {response_text}")
-                        return False
-                    
-        except Exception as e:
-            logger.error(f"Error forwarding to backend: {str(e)}")
-            return False
+# Khởi tạo batch sender
+api_batch_sender = APIBatchSender(batch_size=20, max_wait_time=0.2)
+
+# Thêm endpoint để hiển thị thống kê từ database writer
+routes = web.RouteTableDef()
+
+@routes.get('/db-stats')
+async def get_db_stats(request):
+    """Get database writer statistics"""
+    stats = db_writer.get_stats()
+    return web.json_response(stats)
 
 # Main function
 async def main():
     bridge = DirectBridge()
     await bridge.start()
-    # Keep the server running indefinitely
-    while True:
-        await asyncio.sleep(3600)  # Sleep for an hour
+    
+    # Start the high performance database writer
+    db_writer.start()
+    
+    # Start the API batch sender
+    await api_batch_sender.start()
+    
+    try:
+        # Keep the server running indefinitely
+        while True:
+            await asyncio.sleep(3600)  # Sleep for an hour
+    finally:
+        # Stop the database writer
+        db_writer.stop()
+        # Stop the API batch sender
+        await api_batch_sender.stop()
 
 if __name__ == "__main__":
     print("Starting Direct Bridge - combines TCP server and WebSocket server in one process")
     print("Use localhost:9000 for robots (TCP)")
     print("Use ws://localhost:9003 for frontend (WebSocket)")
     print("-" * 50)
+    app = web.Application()
+    app.add_routes(routes)
     asyncio.run(main())
