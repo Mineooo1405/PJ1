@@ -52,22 +52,26 @@ def receive_messages(sock, robot_id, stop_event):
                             
                             # Send an acknowledgment response
                             response = {
+                                "id": robot_id,  # Đổi từ robot_id thành id
                                 "type": "pid_config_response",
-                                "robot_id": robot_id,
-                                "status": "success",
-                                "motor_id": message.get("motor_id"),
-                                "timestamp": time.time()
+                                "data": {
+                                    "status": "success",
+                                    "motor_id": message.get("motor_id"),
+                                    "time": time.time()
+                                }
                             }
                             print(f"Sending PID response: {response}")
                             send_message(sock, response)
                             
                             # Gửi thêm một pid_response như DirectBridge mong đợi
                             response2 = {
+                                "id": robot_id,  # Đổi từ robot_id thành id
                                 "type": "pid_response",
-                                "robot_id": robot_id,
-                                "status": "success",
-                                "message": f"PID config applied to motor {message.get('motor_id')}",
-                                "timestamp": time.time()
+                                "data": {
+                                    "status": "success",
+                                    "message": f"PID config applied to motor {message.get('motor_id')}",
+                                    "time": time.time()
+                                }
                             }
                             print(f"Sending additional pid_response: {response2}")
                             send_message(sock, response2)
@@ -77,12 +81,14 @@ def receive_messages(sock, robot_id, stop_event):
                             
                             # Send back current firmware version
                             response = {
+                                "id": robot_id,  # Đổi từ robot_id thành id
                                 "type": "firmware_version",
-                                "robot_id": robot_id,
-                                "version": "1.0.0",
-                                "build_date": "2025-04-01",
-                                "status": "stable",
-                                "timestamp": time.time()
+                                "data": {
+                                    "version": "1.0.0",
+                                    "build_date": "2025-04-01",
+                                    "status": "stable",
+                                    "time": time.time()
+                                }
                             }
                             send_message(sock, response)
                             
@@ -94,11 +100,13 @@ def receive_messages(sock, robot_id, stop_event):
                             
                             # Acknowledge start of firmware update
                             response = {
+                                "id": robot_id,  # Đổi từ robot_id thành id
                                 "type": "firmware_response",
-                                "robot_id": robot_id,
-                                "status": "start_ok",
-                                "message": "Ready to receive firmware",
-                                "timestamp": time.time()
+                                "data": {
+                                    "status": "start_ok",
+                                    "message": "Ready to receive firmware",
+                                    "time": time.time()
+                                }
                             }
                             send_message(sock, response)
                             
@@ -112,12 +120,14 @@ def receive_messages(sock, robot_id, stop_event):
                             # Send progress periodically to avoid flooding
                             if chunk_index % 5 == 0 or chunk_index == total_chunks - 1:
                                 response = {
+                                    "id": robot_id,  # Đổi từ robot_id thành id
                                     "type": "firmware_progress",
-                                    "robot_id": robot_id,
-                                    "progress": progress,
-                                    "chunk": chunk_index,
-                                    "total": total_chunks,
-                                    "timestamp": time.time()
+                                    "data": {
+                                        "progress": progress,
+                                        "chunk": chunk_index,
+                                        "total": total_chunks,
+                                        "time": time.time()
+                                    }
                                 }
                                 send_message(sock, response)
                                 
@@ -126,12 +136,14 @@ def receive_messages(sock, robot_id, stop_event):
                             
                             # Send completion notification
                             response = {
+                                "id": robot_id,  # Đổi từ robot_id thành id
                                 "type": "firmware_response",
-                                "robot_id": robot_id,
-                                "status": "success",
-                                "message": "Firmware update successful",
-                                "version": "1.0.1",
-                                "timestamp": time.time()
+                                "data": {
+                                    "status": "success",
+                                    "message": "Firmware update successful",
+                                    "version": "1.0.1",
+                                    "time": time.time()
+                                }
                             }
                             send_message(sock, response)
                             
@@ -153,7 +165,7 @@ def robot_client(robot_id):
         
         print(f"{robot_id}: Connected to TCP server")
 
-        # First send registration message
+        # First send registration message - giữ nguyên định dạng này để tương thích
         registration = {"type": "registration", "robot_id": robot_id}
         send_message(sock, registration)
 
@@ -187,30 +199,39 @@ def robot_client(robot_id):
                 
                 # Send encoder data at target frequency
                 if current_time - last_encoder_send >= encoder_interval:
+                    # Format mới cho encoder data
                     encoder_data = {
+                        "id": robot_id,  # Đổi từ robot_id thành id
                         "type": "encoder",
-                        "robot_id": robot_id,
-                        "rpm1": random.uniform(-30, 30),
-                        "rpm2": random.uniform(-30, 30),
-                        "rpm3": random.uniform(-30, 30),
-                        "timestamp": current_time
+                        "data": [
+                            random.uniform(-30, 30),  # rpm1
+                            random.uniform(-30, 30),  # rpm2
+                            random.uniform(-30, 30)   # rpm3
+                        ]
                     }
                     send_message(sock, encoder_data)
                     last_encoder_send = current_time
                 
                 # Send IMU data at target frequency
                 if current_time - last_imu_send >= imu_interval:
+                    # Format mới cho IMU data
                     imu_data = {
-                        "type": "imu",
-                        "robot_id": robot_id,
-                        "roll": random.uniform(-0.5, 0.5),
-                        "pitch": random.uniform(-0.3, 0.3),
-                        "yaw": random.uniform(-3.14, 3.14),
-                        "qw": 1.0,
-                        "qx": 0.0,
-                        "qy": 0.0,
-                        "qz": 0.0,
-                        "timestamp": current_time
+                        "id": robot_id,  # Đổi từ robot_id thành id
+                        "type": "bno055",  # Đổi từ imu thành bno055
+                        "data": {
+                            "time": current_time,
+                            "euler": [
+                                random.uniform(-0.5, 0.5),    # roll
+                                random.uniform(-0.3, 0.3),    # pitch
+                                random.uniform(-3.14, 3.14)   # yaw
+                            ],
+                            "quaternion": [
+                                1.0,  # qw
+                                0.0,  # qx
+                                0.0,  # qy
+                                0.0   # qz
+                            ]
+                        }
                     }
                     send_message(sock, imu_data)
                     last_imu_send = current_time

@@ -192,19 +192,23 @@ class DirectBridge:
 
                 try:
                     message = json.loads(raw_data.decode().strip())
-                    logger.info(f"Parsed JSON: {json.dumps(message, indent=2)}")
-
+                    logger.info(f"Original message: {json.dumps(message, indent=2)}")
+                    
+                    # Chuyển đổi message sang định dạng chuẩn
+                    transformed_message = transform_robot_message(message)
+                    logger.info(f"Transformed message: {json.dumps(transformed_message, indent=2)}")
+                    
                     # Verify message has robot_id
-                    if "robot_id" not in message:
-                        logger.warning(f"Message from {robot_id} missing robot_id field: {message}")
-                        message["robot_id"] = robot_id
-
+                    if "robot_id" not in transformed_message:
+                        logger.warning(f"Message from {robot_id} missing robot_id field: {transformed_message}")
+                        transformed_message["robot_id"] = robot_id
+                    
                     # Forward message to all connected WebSockets for this robot
                     ws_count = 0
                     for ws in ConnectionManager.get_websockets(robot_id):
-                        await ws.send(json.dumps(message))
+                        await ws.send(json.dumps(transformed_message))
                         ws_count += 1
-
+                    
                     # Log forwarding information
                     if ws_count > 0:
                         logger.info(f"Forwarded message to {ws_count} WebSocket clients")
@@ -212,18 +216,18 @@ class DirectBridge:
                         logger.warning(f"No WebSocket clients to forward message to")
                     
                     # Handle data based on type
-                    data_type = message.get("type")
+                    data_type = transformed_message.get("type")
                     if data_type == "encoder":
-                        db_writer.enqueue_data("encoder", message)
+                        db_writer.enqueue_data("encoder", transformed_message)
                     elif data_type == "imu":
-                        db_writer.enqueue_data("imu", message)
+                        db_writer.enqueue_data("imu", transformed_message)
                     elif data_type in ["heartbeat", "status"]:
                         # Heartbeats và status vẫn có thể gửi qua API
                         async with aiohttp.ClientSession() as session:
                             try:
                                 async with session.post(
                                     'http://localhost:8000/api/robot-data',
-                                    json=message,
+                                    json=transformed_message,
                                     headers={'Content-Type': 'application/json'}
                                 ) as response:
                                     if response.status != 200:
@@ -422,6 +426,79 @@ class DirectBridge:
             # Always clean up
             ConnectionManager.remove_websocket(robot_id, websocket)
             logger.info(f"WebSocket connection closed for {websocket.remote_address}")
+
+def transform_robot_message(message):
+    """
+    Chuyển đổi định dạng JSON từ robot sang định dạng chuẩn cho hệ thống
+    
+    Args:
+        message (dict): Tin nhắn từ robot theo định dạng mới
+    
+    Returns:
+        dict: Tin nhắn đã được chuyển đổi sang định dạng chuẩn
+    """
+    try:
+        # Lấy các thông tin chung
+        robot_id = str(message.get("id", "unknown"))
+        msg_type = message.get("type")
+        current_time = time.time()
+        
+        # Trường hợp dữ liệu encoder
+        if msg_type == "encoder":
+            # Lấy giá trị rpm từ mảng data
+            rpm_array = message.get("data", [0, 0, 0])
+            if len(rpm_array) < 3:
+                rpm_array = rpm_array + [0] * (3 - len(rpm_array))
+                
+            transformed_message = {
+                "type": "encoder",
+                "robot_id": robot_id,
+                "rpm1": rpm_array[0],
+                "rpm2": rpm_array[1],
+                "rpm3": rpm_array[2],
+                "timestamp": current_time
+            }
+            return transformed_message
+            
+        # Trường hợp dữ liệu IMU (bno055)
+        elif msg_type == "bno055":
+            data = message.get("data", {})
+            
+            # Lấy euler angles từ data
+            euler = data.get("euler", [0, 0, 0])
+            if len(euler) < 3:
+                euler = euler + [0] * (3 - len(euler))
+            
+            # Lấy quaternion từ data
+            quaternion = data.get("quaternion", [1, 0, 0, 0])
+            if len(quaternion) < 4:
+                quaternion = quaternion + [0] * (4 - len(quaternion))
+            
+            # Lấy timestamp từ data hoặc sử dụng thời gian hiện tại
+            timestamp = data.get("time", current_time)
+            
+            transformed_message = {
+                "type": "imu",  # Đổi từ bno055 thành imu
+                "robot_id": robot_id,
+                "roll": euler[0],
+                "pitch": euler[1],
+                "yaw": euler[2],
+                "qw": quaternion[0],
+                "qx": quaternion[1],
+                "qy": quaternion[2],
+                "qz": quaternion[3],
+                "timestamp": timestamp
+            }
+            return transformed_message
+            
+        # Các loại tin nhắn khác giữ nguyên
+        else:
+            return message
+            
+    except Exception as e:
+        logger.error(f"Error transforming message: {e}")
+        logger.error(f"Original message: {message}")
+        return message  # Trả về message gốc nếu có lỗi
 
 # Khởi tạo batch sender
 api_batch_sender = APIBatchSender(batch_size=20, max_wait_time=0.2)
