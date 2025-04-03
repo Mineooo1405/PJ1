@@ -14,9 +14,9 @@ class ConnectionManager:
     _tcp_clients = {}  # Map robot_id -> (reader, writer)
     _websockets = {}   # Map robot_id -> list of websockets
     
-    # Tách riêng IP và port
-    _addr_to_robot = {}  # Map (ip, port) -> robot_id
-    _robot_to_addr = {}  # Map robot_id -> (ip, port)
+    # Thêm mới để quản lý theo IP
+    _ip_to_robot = {}  # Map IP:port -> robot_id
+    _robot_to_ip = {}  # Map robot_id -> IP:port
     
     def __new__(cls):
         if cls._instance is None:
@@ -54,34 +54,27 @@ class ConnectionManager:
             logger.info(f"Removed WebSocket for {robot_id}, remaining: {len(cls._websockets[robot_id])}")
     
     @classmethod
-    def set_tcp_client(cls, robot_id, tcp_client, client_addr=None):
-        """Register a TCP client with optional IP address mapping"""
+    def set_tcp_client(cls, robot_id, tcp_client, client_ip=None):
+        """Register a TCP client with optional IP mapping"""
         cls._tcp_clients[robot_id] = tcp_client
         
-        # Lưu ánh xạ giữa địa chỉ và robot_id
-        if client_addr:
-            ip, port = client_addr  # Nhận tuple (ip, port)
-            cls._addr_to_robot[(ip, port)] = robot_id
-            cls._robot_to_addr[robot_id] = (ip, port)
-            logger.info(f"✅ Ánh xạ IP thành công: {ip}:{port} -> {robot_id}")
+        # Lưu mapping giữa IP và robot_id nếu được cung cấp
+        if client_ip:
+            cls._ip_to_robot[client_ip] = robot_id
+            cls._robot_to_ip[robot_id] = client_ip
             
     @classmethod
-    def remove_tcp_client(cls, robot_id):
-        """Remove a TCP client and its address mappings"""
+    def remove_tcp_client(cls, robot_id: str) -> None:
+        """Remove TCP client for a robot"""
+        robot_id = cls.normalize_robot_id(robot_id)
+        
         if robot_id in cls._tcp_clients:
-            # Xóa mapping địa chỉ trước
-            if robot_id in cls._robot_to_addr:
-                addr = cls._robot_to_addr[robot_id]
-                ip, port = addr
-                logger.info(f"🔄 Xóa ánh xạ địa chỉ: {ip}:{port} -> {robot_id}")
-                
-                if addr in cls._addr_to_robot:
-                    del cls._addr_to_robot[addr]
-                del cls._robot_to_addr[robot_id]
-                
-            # Xóa client khỏi map
             del cls._tcp_clients[robot_id]
-            logger.info(f"❌ Đã xóa kết nối robot: {robot_id}")
+            logger.info(f"Removed TCP client for {robot_id}")
+        
+        if robot_id in cls._robot_to_ip:
+            client_ip = cls._robot_to_ip.pop(robot_id)
+            cls._ip_to_robot.pop(client_ip, None)
     
     @classmethod
     def get_websockets(cls, robot_id: str) -> list:
@@ -102,54 +95,33 @@ class ConnectionManager:
         return None
     
     @classmethod
-    def get_tcp_client_by_addr(cls, ip, port=None):
-        """Get TCP client by IP address and optional port"""
-        if port is not None:
-            # Tìm chính xác theo cả IP và port
-            robot_id = cls._addr_to_robot.get((ip, port))
-        else:
-            # Tìm theo chỉ IP (lấy kết quả đầu tiên khớp)
-            for (addr_ip, addr_port), rid in cls._addr_to_robot.items():
-                if addr_ip == ip:
-                    robot_id = rid
-                    break
-            else:
-                robot_id = None
-        
+    def get_tcp_client_by_ip(cls, ip_address):
+        """Get TCP client by IP address"""
+        # Tìm robot_id tương ứng với IP
+        robot_id = cls._ip_to_robot.get(ip_address)
         if robot_id:
+            # Trả về tcp_client tương ứng nếu tìm thấy
             return cls._tcp_clients.get(robot_id)
         return None
-    
-    @classmethod
-    def get_robot_id_by_ip(cls, ip, port=None):
-        """Get robot_id associated with an IP address"""
-        if port is not None:
-            return cls._addr_to_robot.get((ip, port))
         
-        # Tìm robot_id đầu tiên khớp với IP
-        for (addr_ip, addr_port), rid in cls._addr_to_robot.items():
-            if addr_ip == ip:
-                return rid
-        return None
+    @classmethod
+    def get_robot_id_by_ip(cls, ip_address):
+        """Get robot_id associated with an IP address"""
+        return cls._ip_to_robot.get(ip_address)
         
     @classmethod
     def get_ip_by_robot_id(cls, robot_id):
         """Get IP address associated with a robot_id"""
-        addr = cls._robot_to_addr.get(robot_id)
-        if addr:
-            return addr[0]  # Trả về IP
-        return None
-    
+        return cls._robot_to_ip.get(robot_id)
+        
     @classmethod
     def get_all_robots_with_ip(cls):
         """Get list of all robots with their IP addresses"""
         robots = []
-        for robot_id, addr in cls._robot_to_addr.items():
-            ip, port = addr
+        for robot_id, ip in cls._robot_to_ip.items():
             robots.append({
                 "robot_id": robot_id,
                 "ip": ip,
-                "port": port,
                 "connected": robot_id in cls._tcp_clients
             })
         return robots

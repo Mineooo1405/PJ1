@@ -1,7 +1,15 @@
 import React, { useState, useRef, useEffect } from "react";
-import { Upload, AlertCircle, Check, RefreshCw } from "lucide-react";
+import { Upload, AlertCircle, Check, RefreshCw, Wifi, Network } from "lucide-react";
 import tcpWebSocketService from '../services/TcpWebSocketService';
 import { useRobotContext } from './RobotContext';
+
+// Cập nhật interface cho robot
+interface Robot {
+  robot_id: string;
+  ip: string;
+  active?: boolean; // Thêm thuộc tính active (dùng ? để đánh dấu là tùy chọn)
+  port?: number;     // Thêm port nếu API của bạn cũng trả về thông tin này
+}
 
 const FirmwareUpdateWidget: React.FC = () => {
   const { selectedRobotId } = useRobotContext();
@@ -13,6 +21,10 @@ const FirmwareUpdateWidget: React.FC = () => {
   const [isConnected, setIsConnected] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
+  const [useIpAddress, setUseIpAddress] = useState(false);
+  const [ipAddress, setIpAddress] = useState("");
+  const [availableRobots, setAvailableRobots] = useState<Robot[]>([]);
+
   useEffect(() => {
     if (selectedRobotId) {
       tcpWebSocketService.setRobotId(selectedRobotId);
@@ -20,19 +32,44 @@ const FirmwareUpdateWidget: React.FC = () => {
   }, [selectedRobotId]);
 
   useEffect(() => {
-    // Cố gắng kết nối ngay khi component được tạo
+    const loadRobotAddresses = async () => {
+      try {
+        const response = await fetch('http://localhost:9004/connections');
+        if (response.ok) {
+          const data = await response.json();
+          if (data.connections && Array.isArray(data.connections)) {
+            setAvailableRobots(data.connections);
+
+            const selectedRobot = data.connections.find(
+              (r: Robot) => r.robot_id === selectedRobotId
+            );
+            if (selectedRobot) {
+              setIpAddress(selectedRobot.ip);
+            }
+          }
+        }
+      } catch (error) {
+        console.error("Error loading robot addresses:", error);
+      }
+    };
+
+    loadRobotAddresses();
+    const intervalId = setInterval(loadRobotAddresses, 10000);
+    return () => clearInterval(intervalId);
+  }, [selectedRobotId]);
+
+  useEffect(() => {
     if (!tcpWebSocketService.isConnected()) {
       tcpWebSocketService.connect();
     }
-    
-    // Thêm interval để thử kết nối lại định kỳ
+
     const intervalId = setInterval(() => {
       if (!isConnected) {
         console.log("Đang thử kết nối lại tới DirectBridge...");
         tcpWebSocketService.connect();
       }
     }, 10000);
-    
+
     return () => {
       clearInterval(intervalId);
     };
@@ -94,17 +131,30 @@ const FirmwareUpdateWidget: React.FC = () => {
       return;
     }
 
+    if (useIpAddress && !ipAddress) {
+      setErrorMessage("Vui lòng nhập địa chỉ IP của robot");
+      setUploadStatus('error');
+      setTimeout(() => setUploadStatus('idle'), 5000);
+      return;
+    }
+
     try {
       setUploadStatus('uploading');
       setProgress(0);
 
-      const success = tcpWebSocketService.sendMessage({
+      const messageStart = {
         type: "firmware_update_start",
         robot_id: selectedRobotId,
         filename: selectedFile.name,
         filesize: selectedFile.size,
         version: "1.0.1"
-      });
+      };
+
+      if (useIpAddress && ipAddress) {
+        (messageStart as any).target_ip = ipAddress;
+      }
+
+      const success = tcpWebSocketService.sendMessage(messageStart);
 
       if (!success) {
         throw new Error("Không thể khởi tạo quá trình cập nhật firmware");
@@ -121,7 +171,7 @@ const FirmwareUpdateWidget: React.FC = () => {
         const arrayBuffer = event.target.result as ArrayBuffer;
         const bytes = new Uint8Array(arrayBuffer);
 
-        const chunkSize = 1024 * 16;
+        const chunkSize = 1024;
         const totalChunks = Math.ceil(bytes.length / chunkSize);
 
         console.log(`Gửi firmware trong ${totalChunks} chunks, mỗi chunk ${chunkSize} bytes`);
@@ -145,13 +195,19 @@ const FirmwareUpdateWidget: React.FC = () => {
                     .join('')
                 );
 
-                const success = tcpWebSocketService.sendMessage({
+                const chunkMessage: any = {
                   type: "firmware_chunk",
                   robot_id: selectedRobotId,
                   chunk_index: chunkIndex,
                   total_chunks: totalChunks,
                   data: base64Chunk
-                });
+                };
+
+                if (useIpAddress && ipAddress) {
+                  chunkMessage.target_ip = ipAddress;
+                }
+
+                const success = tcpWebSocketService.sendMessage(chunkMessage);
 
                 if (!success) {
                   reject(new Error(`Không thể gửi chunk ${chunkIndex}`));
@@ -172,10 +228,16 @@ const FirmwareUpdateWidget: React.FC = () => {
 
         await sendChunkWithDelay(0);
 
-        tcpWebSocketService.sendMessage({
+        const completeMessage: any = {
           type: "firmware_update_complete",
           robot_id: selectedRobotId
-        });
+        };
+
+        if (useIpAddress && ipAddress) {
+          completeMessage.target_ip = ipAddress;
+        }
+
+        tcpWebSocketService.sendMessage(completeMessage);
       };
 
       reader.onerror = () => {
@@ -207,10 +269,20 @@ const FirmwareUpdateWidget: React.FC = () => {
       return;
     }
 
-    tcpWebSocketService.sendMessage({
+    const versionMessage: any = {
       type: "check_firmware_version",
       robot_id: selectedRobotId
-    });
+    };
+
+    if (useIpAddress && ipAddress) {
+      versionMessage.target_ip = ipAddress;
+    }
+
+    tcpWebSocketService.sendMessage(versionMessage);
+  };
+
+  const selectRobotAddress = (robotId: string, ip: string) => {
+    setIpAddress(ip);
   };
 
   return (
@@ -246,6 +318,70 @@ const FirmwareUpdateWidget: React.FC = () => {
           >
             Kết nối
           </button>
+        )}
+      </div>
+
+      <div className="mb-4">
+        <label className="flex items-center">
+          <input
+            type="checkbox"
+            checked={useIpAddress}
+            onChange={() => setUseIpAddress(!useIpAddress)}
+            className="mr-2"
+          />
+          <span className="font-medium flex items-center">
+            <Wifi size={16} className="mr-1" /> Gửi firmware qua IP
+          </span>
+        </label>
+
+        {useIpAddress && (
+          <div className="mt-2">
+            <label className="block text-sm font-medium text-gray-700 mb-1">
+              Địa chỉ IP
+            </label>
+            <div className="flex gap-2">
+              <input
+                type="text"
+                value={ipAddress}
+                onChange={(e) => setIpAddress(e.target.value)}
+                placeholder="192.168.1.100"
+                className="flex-grow p-2 border border-gray-300 rounded-md"
+              />
+              <button
+                onClick={() => setIpAddress("")}
+                className="p-2 bg-gray-100 text-gray-600 rounded-md hover:bg-gray-200"
+                title="Xóa"
+              >
+                ×
+              </button>
+            </div>
+
+            {availableRobots.length > 0 && (
+              <div className="mt-2">
+                <label className="block text-sm font-medium text-gray-700 mb-1">
+                  Chọn từ danh sách robot
+                </label>
+                <div className="max-h-32 overflow-y-auto border rounded-md divide-y">
+                  {availableRobots.map((robot, index) => (
+                    <div
+                      key={index}
+                      className="p-2 flex justify-between items-center hover:bg-gray-50 cursor-pointer"
+                      onClick={() => selectRobotAddress(robot.robot_id, robot.ip)}
+                    >
+                      <div>
+                        <div className="font-medium">{robot.robot_id}</div>
+                        <div className="text-xs text-gray-500 flex items-center">
+                          <Network size={12} className="mr-1" />
+                          {robot.ip}
+                        </div>
+                      </div>
+                      <div className={`w-2 h-2 rounded-full ${robot.active ? 'bg-green-500' : 'bg-red-500'}`}></div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
         )}
       </div>
 
@@ -306,9 +442,9 @@ const FirmwareUpdateWidget: React.FC = () => {
       <div className="flex justify-end mt-2">
         <button
           onClick={sendFirmware}
-          disabled={!selectedFile || !isConnected || uploadStatus === 'uploading'}
+          disabled={!selectedFile || !isConnected || uploadStatus === 'uploading' || (useIpAddress && !ipAddress)}
           className={`px-4 py-2 rounded-md flex items-center gap-2
-            ${!selectedFile || !isConnected || uploadStatus === 'uploading'
+            ${!selectedFile || !isConnected || uploadStatus === 'uploading' || (useIpAddress && !ipAddress)
               ? 'bg-gray-100 text-gray-400 cursor-not-allowed'
               : 'bg-blue-600 text-white hover:bg-blue-700'
             }`}
@@ -321,7 +457,7 @@ const FirmwareUpdateWidget: React.FC = () => {
           ) : (
             <>
               <Upload size={16} />
-              <span>Cập nhật firmware</span>
+              <span>{useIpAddress ? 'Cập nhật firmware qua IP' : 'Cập nhật firmware'}</span>
             </>
           )}
         </button>
