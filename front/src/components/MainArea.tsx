@@ -10,6 +10,7 @@ interface MainAreaProps {
   onRemoveWidget: (widgetId: string) => void;
   onWidgetMove: (widgetId: string, position: { x: number; y: number }) => void;
   onWidgetResize: (widgetId: string, size: { width: number; height: number }) => void;
+  onWidgetFocus: (widgetId: string) => void; // Thêm prop mới
 }
 
 const MainArea: React.FC<MainAreaProps> = ({ 
@@ -17,7 +18,8 @@ const MainArea: React.FC<MainAreaProps> = ({
   onWidgetDrop, 
   onRemoveWidget,
   onWidgetMove,
-  onWidgetResize
+  onWidgetResize,
+  onWidgetFocus
 }) => {
   const { selectedRobotId } = useRobotContext();
   const containerRef = useRef<HTMLDivElement>(null);
@@ -67,9 +69,11 @@ const MainArea: React.FC<MainAreaProps> = ({
           type={widget.type}
           position={widget.position}
           size={widget.size}
+          zIndex={widget.zIndex || 1} // Truyền zIndex hoặc mặc định là 1
           onRemove={() => onRemoveWidget(widget.id)}
           onMove={(position) => onWidgetMove(widget.id, position)}
           onResize={(size) => onWidgetResize(widget.id, size)}
+          onFocus={() => onWidgetFocus(widget.id)} // Thêm handler cho sự kiện focus
         />
       ))}
     </div>

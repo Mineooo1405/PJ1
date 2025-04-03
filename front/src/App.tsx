@@ -27,6 +27,7 @@ export interface WidgetInstance {
   position: { x: number; y: number };
   size: { width: number; height: number };
   config?: any;
+  zIndex: number; // Thêm thuộc tính zIndex để quản lý thứ tự chồng lớp
 }
 
 const App: React.FC = () => {
@@ -130,6 +131,21 @@ const App: React.FC = () => {
     return () => clearInterval(interval);
   }, []);
 
+  // Thêm useEffect để khởi tạo zIndex cho các widget có sẵn
+  useEffect(() => {
+    // Chỉ chạy một lần khi component mount và có widgets không có zIndex
+    const needsUpdate = widgetInstances.some(widget => widget.zIndex === undefined);
+    
+    if (needsUpdate) {
+      setWidgetInstances(prev => 
+        prev.map((widget, index) => ({
+          ...widget,
+          zIndex: widget.zIndex ?? (index + 1) // Sử dụng giá trị hiện có hoặc vị trí trong mảng
+        }))
+      );
+    }
+  }, []);
+
   // Lọc các widget dựa trên danh mục được chọn
   const filteredWidgets = activeCategory 
     ? widgetOptions.filter(w => w.category === activeCategory)
@@ -145,18 +161,25 @@ const App: React.FC = () => {
     // Tạo ID duy nhất cho widget mới
     const newId = `${widgetType}-${Date.now()}`;
     
+    // Tính toán zIndex cao nhất hiện tại và tăng thêm 1
+    const highestZIndex = widgetInstances.reduce(
+      (max, widget) => Math.max(max, widget.zIndex || 0), 
+      0
+    );
+    
     // Tạo instance mới
     const newWidget: WidgetInstance = {
       id: newId,
       type: widgetType,
       position,
       size: { width: 400, height: 300 }, // Kích thước mặc định
-      config: {} // Cấu hình mặc định
+      config: {}, // Cấu hình mặc định
+      zIndex: highestZIndex + 1 // Widget mới luôn nằm trên cùng
     };
     
     // Thêm widget mới vào danh sách
     setWidgetInstances(prev => [...prev, newWidget]);
-  }, []);
+  }, [widgetInstances]);
   
   // Xử lý xóa widget
   const handleRemoveWidget = useCallback((widgetId: string) => {
@@ -184,6 +207,24 @@ const App: React.FC = () => {
       )
     );
   }, []);
+
+  // Thêm hàm mới để xử lý việc mang widget lên trước
+  const bringWidgetToFront = useCallback((widgetId: string) => {
+    // Tìm z-index cao nhất hiện tại
+    const highestZIndex = widgetInstances.reduce(
+      (max, widget) => Math.max(max, widget.zIndex || 0), 
+      0
+    );
+    
+    // Chỉ cập nhật nếu widget đang không ở trên cùng
+    setWidgetInstances(prev => 
+      prev.map(widget => 
+        widget.id === widgetId && widget.zIndex !== highestZIndex
+          ? { ...widget, zIndex: highestZIndex + 1 }
+          : widget
+      )
+    );
+  }, [widgetInstances]);
   
   // Thêm hàm này trong App component
   const handleAddRandomWidget = useCallback(() => {
@@ -215,18 +256,21 @@ const App: React.FC = () => {
           type: "robot-status",
           position: { x: 20, y: 20 },
           size: { width: 500, height: 600 },
+          zIndex: 1
         },
         {
           id: `robot-control-${Date.now() + 1}`, // Sử dụng robot-control thay vì motor-control
           type: "robot-control",
           position: { x: 540, y: 20 },
           size: { width: 400, height: 300 },
+          zIndex: 2
         },
         {
           id: `trajectory-${Date.now() + 2}`, // Đổi tên
           type: "trajectory",
           position: { x: 540, y: 340 },
           size: { width: 400, height: 400 },
+          zIndex: 3
         },
       ]);
     }
@@ -397,6 +441,7 @@ const App: React.FC = () => {
                   onRemoveWidget={handleRemoveWidget}
                   onWidgetMove={handleWidgetMove}
                   onWidgetResize={handleWidgetResize}
+                  onWidgetFocus={bringWidgetToFront} // Thêm prop mới này
                 />
               </div>
             </div>
