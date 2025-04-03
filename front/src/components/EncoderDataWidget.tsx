@@ -1,8 +1,31 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
-import { RefreshCw, Play, Pause, RotateCcw, Download } from 'lucide-react';
+import { RefreshCw, Play, Pause, RotateCcw, Download, ZoomIn, ZoomOut, Move } from 'lucide-react';
 import WidgetConnectionHeader from './WidgetConnectionHeader';
 import { useRobotContext } from './RobotContext';
 import { Line } from 'react-chartjs-2';
+import {
+  Chart as ChartJS,
+  CategoryScale,
+  LinearScale,
+  PointElement,
+  LineElement,
+  Title,
+  Tooltip,
+  Legend
+} from 'chart.js';
+import zoomPlugin from 'chartjs-plugin-zoom'; // Thêm import cho plugin zoom
+
+// Register Chart.js components
+ChartJS.register(
+  CategoryScale,
+  LinearScale,
+  PointElement,
+  LineElement,
+  Title,
+  Tooltip,
+  Legend,
+  zoomPlugin // Đăng ký plugin zoom
+);
 
 // Modify these constants for faster updates
 const MAX_HISTORY_POINTS = 100;
@@ -62,6 +85,9 @@ const EncoderDataWidget: React.FC = () => {
   const connectionStartTime = useRef<number>(0);
   const databasePollInterval = useRef<NodeJS.Timeout | null>(null);
   const lastDataTimestamp = useRef<number>(0);
+
+  // Thêm tham chiếu đến biểu đồ
+  const chartRef = useRef<any>(null);
 
   // Helper function to get time string
   const getTimeString = (): string => {
@@ -444,6 +470,13 @@ const EncoderDataWidget: React.FC = () => {
     URL.revokeObjectURL(url);
   };
 
+  // Hàm để reset zoom
+  const resetZoom = () => {
+    if (chartRef.current) {
+      chartRef.current.resetZoom();
+    }
+  };
+
   // Chart data
   const chartData = {
     labels: encoderHistory.timestamps,
@@ -478,6 +511,7 @@ const EncoderDataWidget: React.FC = () => {
     ]
   };
 
+  // Fix zoom plugin configuration
   const chartOptions = {
     responsive: true,
     maintainAspectRatio: false,
@@ -510,10 +544,34 @@ const EncoderDataWidget: React.FC = () => {
     plugins: {
       decimation: {
         enabled: true,
-        algorithm: 'lttb' as const, // Use LTTB algorithm for better visual representation
-        samples: 50 // Target number of points
+      },
+      legend: {
+        position: 'top' as const,
+      },
+      zoom: {
+        limits: {
+          x: {minRange: 1},
+          y: {minRange: 1}
+        },
+        pan: {
+          enabled: true,
+          mode: 'xy' as const, // Sử dụng as const thay vì as 'xy'
+          modifierKey: undefined, // Quan trọng: cho phép kéo không cần phím modifier
+          threshold: 10,
+          speed: 10
+        },
+        zoom: {
+          wheel: {
+            enabled: true,
+          },
+          pinch: {
+            enabled: true,
+          },
+          mode: 'xy' as const, // Sử dụng as const thay vì as 'xy'
+          speed: 0.1, // Giảm tốc độ zoom để dễ kiểm soát hơn
+        },
       }
-    }
+    },
   };
 
   // Indicator showing if we're dropping messages
@@ -615,7 +673,25 @@ const EncoderDataWidget: React.FC = () => {
 
       <div className="flex-grow" style={{ height: 'calc(100% - 200px)' }}>
         {encoderHistory.timestamps.length > 0 ? (
-          <Line data={chartData} options={chartOptions} />
+          <div className="relative h-full">
+            <Line 
+              data={chartData} 
+              options={chartOptions} 
+              ref={chartRef} // Thay vì dùng callback function phức tạp
+            />
+            
+            {/* Thêm nút reset zoom */}
+            <div className="absolute top-2 right-2 flex items-center gap-1 bg-white/80 rounded-md px-2 py-1 shadow-sm">
+              <button
+                onClick={resetZoom}
+                className="p-1 hover:bg-gray-100 rounded"
+                title="Reset Zoom"
+              >
+                <RotateCcw size={14} />
+              </button>
+              <span className="text-xs text-gray-500">Zoom: Cuộn chuột | Kéo: Di chuyển</span>
+            </div>
+          </div>
         ) : (
           <div className="h-full flex items-center justify-center text-gray-400">
             No data available. Click the refresh button or enable live updates.

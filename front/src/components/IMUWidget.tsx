@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { useRobotContext } from './RobotContext';
 import WidgetConnectionHeader from './WidgetConnectionHeader';
-import { RefreshCw, Play, Pause, RotateCcw, Download } from 'lucide-react';
+import { RefreshCw, Play, Pause, RotateCcw, Download, ZoomIn, ZoomOut, Move } from 'lucide-react';
 import { Line } from 'react-chartjs-2';
 import {
   Chart as ChartJS,
@@ -13,6 +13,7 @@ import {
   Tooltip,
   Legend
 } from 'chart.js';
+import zoomPlugin from 'chartjs-plugin-zoom'; // Thêm import cho plugin zoom
 
 // Register Chart.js components
 ChartJS.register(
@@ -22,7 +23,8 @@ ChartJS.register(
   LineElement,
   Title,
   Tooltip,
-  Legend
+  Legend,
+  zoomPlugin // Đăng ký plugin zoom
 );
 
 // Performance optimization constants
@@ -333,6 +335,9 @@ const IMUWidget: React.FC = () => {
       z: [] as number[]
     }
   });
+
+  // Thêm tham chiếu đến biểu đồ
+  const chartRef = useRef<any>(null);
 
   // Helper function to get time string
   const getTimeString = (): string => {
@@ -729,6 +734,13 @@ const IMUWidget: React.FC = () => {
     });
   };
 
+  // Hàm để reset zoom
+  const resetZoom = () => {
+    if (chartRef.current) {
+      chartRef.current.resetZoom();
+    }
+  };
+
   // Chart data for different modes
   const chartData = {
     labels: history.timestamps,
@@ -843,6 +855,29 @@ const IMUWidget: React.FC = () => {
         enabled: true,
         algorithm: 'lttb' as const,
         samples: 50
+      },
+      zoom: {
+        limits: {
+          x: {minRange: 1},
+          y: {minRange: 1}
+        },
+        pan: {
+          enabled: true,
+          mode: 'xy' as const, // Sử dụng as const thay vì as 'xy'
+          modifierKey: undefined, // Quan trọng: cho phép kéo không cần phím modifier
+          threshold: 10,
+          speed: 10
+        },
+        zoom: {
+          wheel: {
+            enabled: true,
+          },
+          pinch: {
+            enabled: true,
+          },
+          mode: 'xy' as const, // Sử dụng as const thay vì as 'xy'
+          speed: 0.1, // Giảm tốc độ zoom để dễ kiểm soát hơn
+        },
       }
     },
   };
@@ -999,33 +1034,52 @@ const IMUWidget: React.FC = () => {
         <div className="flex justify-between items-center mb-4">
           <h3 className="font-medium">IMU Data History</h3>
           
-          <div className="inline-flex bg-gray-100 rounded-lg p-1">
-            <button
-              className={`px-3 py-1 rounded-md text-sm ${
-                activeChart === 'orientation'
-                  ? 'bg-white shadow-sm'
-                  : 'text-gray-600 hover:bg-gray-200'
-              }`}
-              onClick={() => setActiveChart('orientation')}
-            >
-              Orientation
-            </button>
-            <button
-              className={`px-3 py-1 rounded-md text-sm ${
-                activeChart === 'quaternion'
-                  ? 'bg-white shadow-sm'
-                  : 'text-gray-600 hover:bg-gray-200'
-              }`}
-              onClick={() => setActiveChart('quaternion')}
-            >
-              Quaternion
-            </button>
+          <div className="flex items-center gap-2">
+            {/* Các nút chuyển đổi chế độ hiện tại */}
+            <div className="inline-flex bg-gray-100 rounded-lg p-1">
+              <button
+                className={`px-3 py-1 rounded-md text-sm ${
+                  activeChart === 'orientation'
+                    ? 'bg-white shadow-sm'
+                    : 'text-gray-600 hover:bg-gray-200'
+                }`}
+                onClick={() => setActiveChart('orientation')}
+              >
+                Orientation
+              </button>
+              <button
+                className={`px-3 py-1 rounded-md text-sm ${
+                  activeChart === 'quaternion'
+                    ? 'bg-white shadow-sm'
+                    : 'text-gray-600 hover:bg-gray-200'
+                }`}
+                onClick={() => setActiveChart('quaternion')}
+              >
+                Quaternion
+              </button>
+            </div>
+            
+            {/* Thêm các nút điều khiển zoom */}
+            <div className="flex items-center gap-1 ml-2">
+              <button
+                onClick={resetZoom}
+                className="p-1.5 bg-gray-100 hover:bg-gray-200 rounded-md text-gray-600"
+                title="Reset Zoom"
+              >
+                <RotateCcw size={16} />
+              </button>
+              <div className="text-xs text-gray-500">Zoom: Cuộn chuột | Kéo: Di chuyển</div>
+            </div>
           </div>
         </div>
 
         <div style={{ height: '250px' }}>
           {history.timestamps.length > 0 ? (
-            <Line data={chartData} options={chartOptions} />
+            <Line 
+            data={chartData} 
+            options={chartOptions} 
+            ref={chartRef} // Thay vì dùng callback function phức tạp
+          />
           ) : (
             <div className="h-full flex items-center justify-center text-gray-400">
               No data available. Click the refresh button or enable live updates.
