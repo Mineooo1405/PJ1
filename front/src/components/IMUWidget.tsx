@@ -28,14 +28,16 @@ ChartJS.register(
 );
 
 // Performance optimization constants
-const MAX_HISTORY_POINTS = 100;
-const UI_UPDATE_INTERVAL = 50; // More responsive UI
-const DATABASE_POLL_INTERVAL = 100; // More frequent polling
+const MAX_HISTORY_POINTS = 10000;
+const UI_UPDATE_INTERVAL = 20;
 
-// Get WebSocket URL for FastAPI backend
+// Cập nhật URL WebSocket để kết nối trực tiếp với DirectBridge
 const getWebSocketUrl = (robotId: string): string => {
   const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-  return `${protocol}//localhost:8000/ws/${robotId}`;
+  const hostname = window.location.hostname === 'localhost' ? 'localhost' : window.location.hostname;
+  
+  // Kết nối trực tiếp đến DirectBridge
+  return `${protocol}//${hostname}:9003/ws/${robotId}`;
 };
 
 // Replace the current SimpleCompassVisualizer with this simpler YPR visualization
@@ -339,29 +341,51 @@ const IMUWidget: React.FC = () => {
   // Thêm tham chiếu đến biểu đồ
   const chartRef = useRef<any>(null);
 
+  // Thêm state để quản lý chế độ tạm dừng cập nhật biểu đồ
+  const [isPaused, setIsPaused] = useState(false);
+
   // Helper function to get time string
   const getTimeString = (): string => {
     return new Date().toLocaleTimeString();
   };
-  
+
+  // Sửa hàm getTimeString để sử dụng timestamp từ dữ liệu
+  const getTimeForData = (timestamp: number): string => {
+    // Thay vì chỉ lấy milliseconds, lấy ra cả microseconds bằng cách giữ nguyên số thập phân
+    return timestamp.toFixed(6); // Giữ lại 6 chữ số thập phân
+  };
+
   // Process any buffered messages and update the UI
+  // Cập nhật hàm processMessageBuffer để kiểm tra trạng thái tạm dừng
   const processMessageBuffer = useCallback(() => {
-    // Cancel any pending animation frame
     if (animationFrameId.current !== null) {
       cancelAnimationFrame(animationFrameId.current);
       animationFrameId.current = null;
     }
     
-    // Process all messages in buffer
     if (messageBuffer.current.length === 0) {
       return;
     }
+    
+    console.log(`Processing ${messageBuffer.current.length} IMU messages in batch`);
     
     // Get and process all messages
     const messages = [...messageBuffer.current];
     messageBuffer.current = []; // Clear buffer
     
-    // Process each message in sequence
+    // Tổng hợp dữ liệu theo timestamp
+    const timestampMap: Map<string, {
+      roll: number,
+      pitch: number,
+      yaw: number,
+      quat_w: number,
+      quat_x: number,
+      quat_y: number,
+      quat_z: number,
+      timestamp: number
+    }> = new Map();
+    
+    // Xử lý tất cả tin nhắn để lấy giá trị mới nhất cho mỗi timestamp
     for (const message of messages) {
       if (message.type === 'imu_data') {
         // Extract values
@@ -381,74 +405,93 @@ const IMUWidget: React.FC = () => {
                       (message.qy ?? 0.0);
         const quat_z = typeof message.quat_z === 'number' ? message.quat_z : 
                       (message.qz ?? 0.0);
-                      
-        // Use the latest values for display
-        if (message === messages[messages.length - 1]) {
-          setImuData({
-            roll,
-            pitch,
-            yaw,
-            quat_w,
-            quat_x,
-            quat_y,
-            quat_z,
-            timestamp: message.timestamp || Date.now() / 1000
-          });
-        }
         
-        // Add to chart history
-        setHistory(prev => {
-          const newTimestamps = [...prev.timestamps, getTimeString()];
-          
-          // Update orientation
-          const newRoll = [...prev.orientation.roll, roll];
-          const newPitch = [...prev.orientation.pitch, pitch];
-          const newYaw = [...prev.orientation.yaw, yaw];
-          
-          // Update quaternion
-          const newQuatW = [...prev.quaternion.w, quat_w];
-          const newQuatX = [...prev.quaternion.x, quat_x];
-          const newQuatY = [...prev.quaternion.y, quat_y];
-          const newQuatZ = [...prev.quaternion.z, quat_z];
-          
-          // Limit the number of points
-          if (newTimestamps.length > MAX_HISTORY_POINTS) {
-            return {
-              timestamps: newTimestamps.slice(-MAX_HISTORY_POINTS),
-              orientation: {
-                roll: newRoll.slice(-MAX_HISTORY_POINTS),
-                pitch: newPitch.slice(-MAX_HISTORY_POINTS),
-                yaw: newYaw.slice(-MAX_HISTORY_POINTS)
-              },
-              quaternion: {
-                w: newQuatW.slice(-MAX_HISTORY_POINTS),
-                x: newQuatX.slice(-MAX_HISTORY_POINTS),
-                y: newQuatY.slice(-MAX_HISTORY_POINTS),
-                z: newQuatZ.slice(-MAX_HISTORY_POINTS)
-              }
-            };
-          }
-          
-          return {
-            timestamps: newTimestamps,
-            orientation: {
-              roll: newRoll,
-              pitch: newPitch,
-              yaw: newYaw
-            },
-            quaternion: {
-              w: newQuatW,
-              x: newQuatX,
-              y: newQuatY,
-              z: newQuatZ
-            }
-          };
+        // Lấy timestamp từ dữ liệu
+        const timestamp = message.timestamp || Date.now() / 1000;
+        
+        // Lấy timestamp đã được làm tròn đến giây
+        const timeKey = getTimeForData(timestamp);
+        
+        // Cập nhật giá trị mới nhất cho timestamp này
+        timestampMap.set(timeKey, {
+          roll,
+          pitch,
+          yaw,
+          quat_w,
+          quat_x,
+          quat_y,
+          quat_z,
+          timestamp
         });
       }
     }
     
+    // Sử dụng giá trị mới nhất cho hiển thị realtime
+    if (timestampMap.size > 0) {
+      const latestValues = Array.from(timestampMap.values()).pop();
+      if (latestValues) {
+        setImuData(latestValues);
+      }
+    }
+    
+    // Chỉ cập nhật biểu đồ nếu không ở chế độ tạm dừng
+    if (!isPaused && timestampMap.size > 0) {
+      setHistory(prev => {
+        // Tạo mảng mới với các điểm đã tổng hợp, sắp xếp theo thời gian
+        const sortedEntries = Array.from(timestampMap.entries())
+          .sort((a, b) => parseFloat(a[0]) - parseFloat(b[0]));
+        
+        // Tách các mảng mới để thêm vào history
+        const newTimestamps = sortedEntries.map(([timeKey]) => timeKey);
+        const newOrientationRoll = sortedEntries.map(([, values]) => values.roll);
+        const newOrientationPitch = sortedEntries.map(([, values]) => values.pitch);
+        const newOrientationYaw = sortedEntries.map(([, values]) => values.yaw);
+        const newQuaternionW = sortedEntries.map(([, values]) => values.quat_w);
+        const newQuaternionX = sortedEntries.map(([, values]) => values.quat_x);
+        const newQuaternionY = sortedEntries.map(([, values]) => values.quat_y);
+        const newQuaternionZ = sortedEntries.map(([, values]) => values.quat_z);
+        
+        // Kết hợp với dữ liệu trước đó
+        const combinedTimestamps = [...prev.timestamps, ...newTimestamps];
+        
+        // Giới hạn số điểm trong history
+        if (combinedTimestamps.length > MAX_HISTORY_POINTS) {
+          return {
+            timestamps: combinedTimestamps.slice(-MAX_HISTORY_POINTS),
+            orientation: {
+              roll: [...prev.orientation.roll, ...newOrientationRoll].slice(-MAX_HISTORY_POINTS),
+              pitch: [...prev.orientation.pitch, ...newOrientationPitch].slice(-MAX_HISTORY_POINTS),
+              yaw: [...prev.orientation.yaw, ...newOrientationYaw].slice(-MAX_HISTORY_POINTS)
+            },
+            quaternion: {
+              w: [...prev.quaternion.w, ...newQuaternionW].slice(-MAX_HISTORY_POINTS),
+              x: [...prev.quaternion.x, ...newQuaternionX].slice(-MAX_HISTORY_POINTS),
+              y: [...prev.quaternion.y, ...newQuaternionY].slice(-MAX_HISTORY_POINTS),
+              z: [...prev.quaternion.z, ...newQuaternionZ].slice(-MAX_HISTORY_POINTS)
+            }
+          };
+        }
+        
+        return {
+          timestamps: combinedTimestamps,
+          orientation: {
+            roll: [...prev.orientation.roll, ...newOrientationRoll],
+            pitch: [...prev.orientation.pitch, ...newOrientationPitch],
+            yaw: [...prev.orientation.yaw, ...newOrientationYaw]
+          },
+          quaternion: {
+            w: [...prev.quaternion.w, ...newQuaternionW],
+            x: [...prev.quaternion.x, ...newQuaternionX],
+            y: [...prev.quaternion.y, ...newQuaternionY],
+            z: [...prev.quaternion.z, ...newQuaternionZ]
+          }
+        };
+      });
+    }
+    
     lastUIUpdateTime.current = Date.now();
-  }, []);
+    console.log(`UI updated at ${new Date().toLocaleTimeString()} with ${timestampMap.size} data points`);
+  }, [isPaused]);
 
   // Schedule UI updates using requestAnimationFrame for smoother performance
   const scheduleUIUpdate = useCallback(() => {
@@ -507,27 +550,16 @@ const IMUWidget: React.FC = () => {
       setIsConnected(true);
       setError(null);
       
-      // Start live updates automatically
       setTimeout(() => {
         console.log('Starting live updates automatically');
         setLiveUpdate(true);
+        
+        // Gửi yêu cầu subscribe để nhận dữ liệu trực tiếp, không cần thiết lập polling
         sendMessage({
-          type: "subscribe_imu"
+          type: "subscribe_imu" // hoặc "subscribe_imu" cho IMUWidget
         });
         
-        // Start polling for database updates
-        if (databasePollInterval.current === null) {
-          console.log('Starting database polling');
-          databasePollInterval.current = setInterval(() => {
-            if (isConnected) {
-              console.log(`Polling for new IMU data since ${new Date(lastDataTimestamp.current * 1000).toISOString()}`);
-              sendMessage({
-                type: "get_imu_data_since",
-                since: lastDataTimestamp.current
-              });
-            }
-          }, DATABASE_POLL_INTERVAL);
-        }
+        // Không cần thiết lập databasePollInterval nữa
       }, 300);
     };
 
@@ -557,39 +589,78 @@ const IMUWidget: React.FC = () => {
       setError('Failed to connect to the server');
     };
 
+    // Cập nhật hàm xử lý tin nhắn WebSocket
     newSocket.onmessage = (event) => {
       try {
         const data = JSON.parse(event.data);
         console.log("Received WebSocket data:", data);
         
-        if (data.type === 'imu_data') {
-          // Update message counter
-          messageCounter.current++;
+        // Xử lý dữ liệu từ bno055 hoặc imu_data
+        if (data.type === 'bno055' || data.type === 'imu_data') {
+          let values;
           
-          // Update last timestamp for polling
-          if (data.timestamp > lastDataTimestamp.current) {
-            lastDataTimestamp.current = data.timestamp;
-            console.log(`Updated lastDataTimestamp to ${new Date(lastDataTimestamp.current * 1000).toISOString()}`);
+          if (data.type === 'bno055') {
+            // Định dạng dữ liệu trực tiếp từ robot
+            const imuData = data.data || {};
+            const eulerData = imuData.euler || [0, 0, 0];
+            const quaternionData = imuData.quaternion || [1, 0, 0, 0];
+            
+            values = {
+              roll: eulerData[0] || 0,
+              pitch: eulerData[1] || 0,
+              yaw: eulerData[2] || 0,
+              quat_w: quaternionData[0] || 1.0,
+              quat_x: quaternionData[1] || 0.0,
+              quat_y: quaternionData[2] || 0.0,
+              quat_z: quaternionData[3] || 0.0,
+              timestamp: imuData.time || data.timestamp || Date.now() / 1000
+            };
+          } else {
+            // Định dạng dữ liệu cũ từ database
+            values = {
+              roll: typeof data.roll === 'number' ? data.roll : 
+                    (data.orientation?.roll ?? 0),
+              pitch: typeof data.pitch === 'number' ? data.pitch : 
+                    (data.orientation?.pitch ?? 0),
+              yaw: typeof data.yaw === 'number' ? data.yaw : 
+                    (data.orientation?.yaw ?? 0),
+              quat_w: typeof data.quat_w === 'number' ? data.quat_w : 
+                      (data.qw ?? 1.0),
+              quat_x: typeof data.quat_x === 'number' ? data.quat_x : 
+                      (data.qx ?? 0.0),
+              quat_y: typeof data.quat_y === 'number' ? data.quat_y : 
+                      (data.qy ?? 0.0),
+              quat_z: typeof data.quat_z === 'number' ? data.quat_z : 
+                      (data.qz ?? 0.0),
+              timestamp: data.timestamp || Date.now() / 1000
+            };
           }
           
-          // Add to message buffer
-          messageBuffer.current.push(data);
+          console.log("Processing IMU values:", values);
           
-          // Clear loading state
+          // Cập nhật buffer
+          messageBuffer.current.push({
+            type: 'imu_data',
+            ...values,
+            original: data
+          });
+          
+          // Cập nhật timestamp gần nhất
+          lastDataTimestamp.current = values.timestamp;
+          
           if (loading) {
             setLoading(false);
           }
           
-          // Schedule UI update
+          // Lên lịch cập nhật UI
           scheduleUIUpdate();
-        } else if (data.type === 'error') {
-          setError(data.message || 'Unknown error');
-          setLoading(false);
-        } else if (data.type === 'info') {
-          console.log("Info from server:", data.message);
+          
+          // Tăng bộ đếm tin nhắn
+          messageCounter.current++;
         }
       } catch (err) {
         console.error("Failed to parse WebSocket message:", err);
+        setError("Error processing data: " + (err instanceof Error ? err.message : String(err)));
       }
     };
 
@@ -663,6 +734,11 @@ const IMUWidget: React.FC = () => {
       return newValue;
     });
   }, [isConnected, sendMessage, selectedRobotId]);
+
+  // Thêm hàm để bật/tắt chế độ tạm dừng
+  const togglePause = useCallback(() => {
+    setIsPaused(prev => !prev);
+  }, []);
 
   // Set up periodic UI update ticker
   useEffect(() => {
@@ -820,12 +896,14 @@ const IMUWidget: React.FC = () => {
     },
     elements: {
       line: {
-        tension: 0.2 // Slight smoothing for better visuals
+        tension: 0.3, // Tăng độ mượt của đường
+        cubicInterpolationMode: 'monotone' as const, // Thêm chế độ nội suy đường cong
+        stepped: false // Đảm bảo không hiển thị kiểu bậc thang
       },
       point: {
-        radius: 2, // Default point size
-        hitRadius: 10, // Larger hit area for interaction
-        hoverRadius: 5, // Size when hovering
+        radius: 1, // Giảm kích thước điểm để biểu đồ trông mượt mà hơn
+        hitRadius: 10, 
+        hoverRadius: 5
       }
     },
     scales: {
@@ -863,8 +941,8 @@ const IMUWidget: React.FC = () => {
         },
         pan: {
           enabled: true,
-          mode: 'xy' as const, // Sử dụng as const thay vì as 'xy'
-          modifierKey: undefined, // Quan trọng: cho phép kéo không cần phím modifier
+          mode: 'xy' as const,
+          modifierKey: undefined,
           threshold: 10,
           speed: 10
         },
@@ -875,8 +953,8 @@ const IMUWidget: React.FC = () => {
           pinch: {
             enabled: true,
           },
-          mode: 'xy' as const, // Sử dụng as const thay vì as 'xy'
-          speed: 0.1, // Giảm tốc độ zoom để dễ kiểm soát hơn
+          mode: 'xy' as const,
+          speed: 0.1,
         },
       }
     },
@@ -928,13 +1006,33 @@ const IMUWidget: React.FC = () => {
           {liveUpdate ? (
             <>
               <Pause size={14} />
-              <span>Live: ON</span>
               {messageRate}
             </>
           ) : (
             <>
               <Play size={14} />
-              <span>Live: OFF</span>
+            </>
+          )}
+        </button>
+        
+        {/* Nút Pause mới */}
+        <button
+          onClick={togglePause}
+          disabled={!isConnected || !liveUpdate}
+          className={`px-3 py-1.5 rounded-md flex items-center gap-1 disabled:opacity-50 disabled:cursor-not-allowed
+                    ${isPaused 
+                      ? 'bg-amber-500 text-white hover:bg-amber-600' 
+                      : 'bg-gray-200 text-gray-800 hover:bg-gray-300'}`}
+        >
+          {isPaused ? (
+            <>
+              <Play size={14} />
+              <span>Resume</span>
+            </>
+          ) : (
+            <>
+              <Pause size={14} />
+              <span>Freeze Chart</span>
             </>
           )}
         </button>

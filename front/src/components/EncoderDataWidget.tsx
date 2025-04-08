@@ -28,16 +28,20 @@ ChartJS.register(
 );
 
 // Modify these constants for faster updates
-const MAX_HISTORY_POINTS = 100;
-const UI_UPDATE_INTERVAL = 50; // Reduce to 50ms for more responsive UI
-const CHART_SAMPLING_RATE = 1; // Set to 1 to update chart with every data point
-const DATABASE_POLL_INTERVAL = 100; // More frequent polling (100ms instead of 200ms)
+const MAX_HISTORY_POINTS = 10000;
+const UI_UPDATE_INTERVAL = 20;
 
-// Get WebSocket URL for FastAPI backend
+// Cập nhật hàm getWebSocketUrl đảm bảo kết nối đến Backend đúng
 const getWebSocketUrl = (robotId: string): string => {
   const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-  // Force localhost:8000 which is where your FastAPI backend is running
-  return `${protocol}//localhost:8000/ws/${robotId}`;
+  const hostname = window.location.hostname === 'localhost' ? 'localhost' : window.location.hostname;
+  
+  // Hỗ trợ cả kết nối qua DirectBridge và FastAPI
+  // Nếu kết nối trực tiếp đến DirectBridge, sử dụng port 9003
+  // Nếu kết nối qua FastAPI, sử dụng port 8000 
+  return `${protocol}//${hostname}:9003/ws/${robotId}`;
+  // Hoặc sử dụng FastAPI endpoint:
+  // return `${protocol}//${hostname}:8000/ws/${robotId}`;
 };
 
 interface EncoderData {
@@ -74,6 +78,8 @@ const EncoderDataWidget: React.FC = () => {
   const [liveUpdate, setLiveUpdate] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // Add isPaused state here so it can be used throughout the component
+  const [isPaused, setIsPaused] = useState(false);
   
   // Performance optimization refs
   const messageBuffer = useRef<any[]>([]);
@@ -93,85 +99,126 @@ const EncoderDataWidget: React.FC = () => {
   const getTimeString = (): string => {
     return new Date().toLocaleTimeString();
   };
+
+  // Sửa hàm getTimeString để sử dụng timestamp từ dữ liệu
+  const getTimeForData = (timestamp: number): string => {
+    // Thay vì chỉ lấy milliseconds, lấy ra cả microseconds bằng cách giữ nguyên số thập phân
+    return timestamp.toFixed(6); // Giữ lại 6 chữ số thập phân
+  };
   
-  // Process any buffered messages and update the UI
-  const processMessageBuffer = useCallback(() => {
-    // Cancel any pending animation frame
-    if (animationFrameId.current !== null) {
-      cancelAnimationFrame(animationFrameId.current);
-      animationFrameId.current = null;
+  // Thay đổi hàm processMessageBuffer để tổng hợp và xử lý dữ liệu theo lô
+const processMessageBuffer = useCallback(() => {
+  // Cancel any pending animation frame
+  if (animationFrameId.current !== null) {
+    cancelAnimationFrame(animationFrameId.current);
+    animationFrameId.current = null;
+  }
+  
+  // Process all messages in buffer
+  if (messageBuffer.current.length === 0) {
+    return;
+  }
+  
+  console.log(`Processing ${messageBuffer.current.length} encoder messages in batch`);
+  
+  // Get all messages for batch processing
+  const messages = [...messageBuffer.current];
+  messageBuffer.current = []; // Clear buffer
+  
+  // Tổng hợp dữ liệu theo timestamp để tránh điểm trùng lặp
+  const timestampMap: Map<string, {
+    rpm_1: number,
+    rpm_2: number,
+    rpm_3: number,
+    timestamp: number
+  }> = new Map();
+  
+  // Xử lý tất cả tin nhắn để lấy giá trị mới nhất cho mỗi timestamp
+  for (const message of messages) {
+    if (message.type === 'encoder_data') {
+      const encoderValues = {
+        rpm_1: typeof message.rpm_1 === 'number' ? message.rpm_1 : 0,
+        rpm_2: typeof message.rpm_2 === 'number' ? message.rpm_2 : 0,
+        rpm_3: typeof message.rpm_3 === 'number' ? message.rpm_3 : 0,
+        timestamp: message.timestamp || Date.now() / 1000
+      };
+      
+      // Lấy timestamp đã được làm tròn đến giây (hoặc phần nhỏ hơn nếu muốn)
+      const timeKey = getTimeForData(encoderValues.timestamp);
+      
+      // Cập nhật giá trị mới nhất cho timestamp này
+      timestampMap.set(timeKey, encoderValues);
     }
-    
-    // Process all messages in buffer (not just the last one)
-    if (messageBuffer.current.length === 0) {
-      return;
+  }
+  
+  // Sử dụng giá trị mới nhất cho hiển thị realtime (luôn cập nhật)
+  if (timestampMap.size > 0) {
+    const latestValues = Array.from(timestampMap.values()).pop();
+    if (latestValues) {
+      setEncoderData(latestValues);
+      setRpmValues([latestValues.rpm_1, latestValues.rpm_2, latestValues.rpm_3]);
     }
-    
-    // Get and process all messages - this is important for faster updates
-    const messages = [...messageBuffer.current];
-    messageBuffer.current = []; // Clear buffer
-    
-    // Process each message in sequence
-    for (const message of messages) {
-      if (message.type === 'encoder_data') {
-        const encoderValues = {
-          rpm_1: typeof message.rpm_1 === 'number' ? message.rpm_1 : 0,
-          rpm_2: typeof message.rpm_2 === 'number' ? message.rpm_2 : 0,
-          rpm_3: typeof message.rpm_3 === 'number' ? message.rpm_3 : 0,
-          timestamp: message.timestamp || Date.now()
+  }
+  
+  // Chỉ cập nhật biểu đồ nếu không ở chế độ tạm dừng
+  if (!isPaused && timestampMap.size > 0) {
+    setEncoderHistory(prev => {
+      // Tạo mảng mới với các điểm đã tổng hợp, sắp xếp theo thời gian
+      const sortedEntries = Array.from(timestampMap.entries())
+        .sort((a, b) => parseFloat(a[0]) - parseFloat(b[0]));
+      
+      // Tách các mảng mới để thêm vào history
+      const newTimestamps = sortedEntries.map(([timeKey]) => timeKey);
+      const newEncoder1 = sortedEntries.map(([, values]) => values.rpm_1);
+      const newEncoder2 = sortedEntries.map(([, values]) => values.rpm_2);
+      const newEncoder3 = sortedEntries.map(([, values]) => values.rpm_3);
+      
+      // Kết hợp với dữ liệu trước đó
+      const combinedTimestamps = [...prev.timestamps, ...newTimestamps];
+      const combinedEncoder1 = [...prev.encoder1, ...newEncoder1];
+      const combinedEncoder2 = [...prev.encoder2, ...newEncoder2];
+      const combinedEncoder3 = [...prev.encoder3, ...newEncoder3];
+      
+      // Giới hạn số điểm trong history
+      if (combinedTimestamps.length > MAX_HISTORY_POINTS) {
+        return {
+          timestamps: combinedTimestamps.slice(-MAX_HISTORY_POINTS),
+          encoder1: combinedEncoder1.slice(-MAX_HISTORY_POINTS),
+          encoder2: combinedEncoder2.slice(-MAX_HISTORY_POINTS),
+          encoder3: combinedEncoder3.slice(-MAX_HISTORY_POINTS)
         };
-        
-        // Use the latest values for current display
-        if (message === messages[messages.length - 1]) {
-          setEncoderData(encoderValues);
-          setRpmValues([encoderValues.rpm_1, encoderValues.rpm_2, encoderValues.rpm_3]);
-        }
-        
-        // Add to chart history - this adds every point for more complete charts
-        setEncoderHistory(prev => {
-          const newTimestamps = [...prev.timestamps, getTimeString()];
-          const newEncoder1 = [...prev.encoder1, encoderValues.rpm_1];
-          const newEncoder2 = [...prev.encoder2, encoderValues.rpm_2];
-          const newEncoder3 = [...prev.encoder3, encoderValues.rpm_3];
-          
-          // Limit the number of points
-          if (newTimestamps.length > MAX_HISTORY_POINTS) {
-            return {
-              timestamps: newTimestamps.slice(-MAX_HISTORY_POINTS),
-              encoder1: newEncoder1.slice(-MAX_HISTORY_POINTS),
-              encoder2: newEncoder2.slice(-MAX_HISTORY_POINTS),
-              encoder3: newEncoder3.slice(-MAX_HISTORY_POINTS)
-            };
-          }
-          
-          return {
-            timestamps: newTimestamps,
-            encoder1: newEncoder1,
-            encoder2: newEncoder2,
-            encoder3: newEncoder3
-          };
-        });
       }
-    }
-    
-    lastUIUpdateTime.current = Date.now();
-  }, []);
+      
+      return {
+        timestamps: combinedTimestamps,
+        encoder1: combinedEncoder1,
+        encoder2: combinedEncoder2,
+        encoder3: combinedEncoder3
+      };
+    });
+  }
+  
+  lastUIUpdateTime.current = Date.now();
+  console.log(`UI updated at ${new Date().toLocaleTimeString()} with ${timestampMap.size} data points`);
+}, [isPaused]);
 
   // Schedule UI updates using requestAnimationFrame for smoother performance
   const scheduleUIUpdate = useCallback(() => {
-    if (animationFrameId.current !== null) {
-      return; // Already scheduled
-    }
-    
-    const now = Date.now();
-    if (messageBuffer.current.length > 0 && now - lastUIUpdateTime.current > UI_UPDATE_INTERVAL) {
-      // Time to update UI
-      animationFrameId.current = requestAnimationFrame(() => {
-        processMessageBuffer();
-        animationFrameId.current = null;
-      });
-    }
-  }, [processMessageBuffer]);
+  if (animationFrameId.current !== null) {
+    return; // Already scheduled
+  }
+  
+  const now = Date.now();
+  const timeSinceLastUpdate = now - lastUIUpdateTime.current;
+  
+  if (messageBuffer.current.length > 0 && timeSinceLastUpdate >= UI_UPDATE_INTERVAL) {
+    // Time to update UI - use requestAnimationFrame for smooth rendering
+    animationFrameId.current = requestAnimationFrame(() => {
+      processMessageBuffer();
+      animationFrameId.current = null;
+    });
+  }
+}, [processMessageBuffer]);
 
   // Connect to WebSocket
   const connect = useCallback(() => {
@@ -206,35 +253,25 @@ const EncoderDataWidget: React.FC = () => {
     
     const newSocket = new WebSocket(wsUrl);
     
-    newSocket.onopen = () => {
-      console.log(`Connected to backend WebSocket for robot ${selectedRobotId}`);
-      setStatus('connected');
-      setIsConnected(true);
-      setError(null);
-      
-      // Start live updates automatically
-      setTimeout(() => {
-        console.log('Starting live updates automatically');
-        setLiveUpdate(true);
-        sendMessage({
-          type: "subscribe_encoder"
-        });
-        
-        // Start polling for database updates
-        if (databasePollInterval.current === null) {
-          console.log('Starting database polling');
-          databasePollInterval.current = setInterval(() => {
-            if (isConnected) {
-              console.log(`Polling for new data since ${new Date(lastDataTimestamp.current * 1000).toISOString()}`);
-              sendMessage({
-                type: "get_encoder_data_since", // This is the message type your backend should handle
-                since: lastDataTimestamp.current
-              });
-            }
-          }, DATABASE_POLL_INTERVAL);
-        }
-      }, 300);
-    };
+    // Không cần interval để poll database nữa, chỉ lắng nghe tin nhắn WebSocket
+newSocket.onopen = () => {
+  console.log(`Connected to backend WebSocket for robot ${selectedRobotId}`);
+  setStatus('connected');
+  setIsConnected(true);
+  setError(null);
+  
+  setTimeout(() => {
+    console.log('Starting live updates automatically');
+    setLiveUpdate(true);
+    
+    // Gửi yêu cầu subscribe để nhận dữ liệu trực tiếp, không cần thiết lập polling
+    sendMessage({
+      type: "subscribe_encoder" // hoặc "subscribe_imu" cho IMUWidget
+    });
+    
+    // Không cần thiết lập databasePollInterval nữa
+  }, 300);
+};
 
     // Add detailed error handling for WebSocket
     newSocket.onclose = (event) => {
@@ -263,60 +300,70 @@ const EncoderDataWidget: React.FC = () => {
       setError('Failed to connect to the server. Make sure the backend is running.');
     };
 
-    newSocket.onmessage = (event) => {
-      try {
-        const data = JSON.parse(event.data);
-        console.log("Received WebSocket data:", data);
-        
-        if (data.type === 'encoder_data') {
-          // Handle field name differences (rpm_1 vs rpm1)
-          const values = {
-            rpm_1: data.rpm_1 !== undefined ? data.rpm_1 : 
-                   (data.rpm1 !== undefined ? data.rpm1 : 0),
-            rpm_2: data.rpm_2 !== undefined ? data.rpm_2 : 
-                   (data.rpm2 !== undefined ? data.rpm2 : 0),
-            rpm_3: data.rpm_3 !== undefined ? data.rpm_3 : 
-                   (data.rpm3 !== undefined ? data.rpm3 : 0),
-            timestamp: data.timestamp || Date.now() / 1000
-          };
-          
-          // Update last timestamp for polling
-          if (values.timestamp > lastDataTimestamp.current) {
-            lastDataTimestamp.current = values.timestamp;
-            console.log(`Updated lastDataTimestamp to ${new Date(lastDataTimestamp.current * 1000).toISOString()}`);
-          }
-          
-          // Update message buffer
-          messageBuffer.current.push({
-            type: 'encoder_data',
-            rpm_1: values.rpm_1,
-            rpm_2: values.rpm_2,
-            rpm_3: values.rpm_3,
-            timestamp: values.timestamp
-          });
-          
-          // Clear loading state
-          if (loading) {
-            setLoading(false);
-          }
-          
-          // Schedule UI update
-          scheduleUIUpdate();
-        } else if (data.type === 'error') {
-          setError(data.message || "An error occurred while receiving encoder data");
-          setLoading(false);
-        } else if (data.type === 'info') {
-          // Just log info messages
-          console.log("Info from server:", data.message);
-        } else {
-          console.log("Unhandled message type:", data);
-        }
-      } catch (err) {
-        console.error("Failed to parse WebSocket message:", err);
-        setError("Error processing data: " + (err instanceof Error ? err.message : String(err)));
+    // Sửa hàm xử lý tin nhắn onmessage để nhận dữ liệu trực tiếp từ robot
+
+newSocket.onmessage = (event) => {
+  try {
+    const data = JSON.parse(event.data);
+    console.log("Received WebSocket data:", data);
+    
+    // Xử lý nhiều loại message types
+    if (data.type === 'encoder' || data.type === 'encoder_data') {
+      let values;
+      
+      if (data.type === 'encoder') {
+        // Định dạng dữ liệu trực tiếp từ robot
+        const rpms = Array.isArray(data.data) ? data.data : [0, 0, 0];
+        values = {
+          rpm_1: rpms[0] || 0,
+          rpm_2: rpms[1] || 0,
+          rpm_3: rpms[2] || 0,
+          timestamp: data.timestamp || Date.now() / 1000
+        };
+      } else {
+        // Định dạng dữ liệu cũ từ database
+        values = {
+          rpm_1: data.rpm_1 !== undefined ? data.rpm_1 : 
+                 (data.rpm1 !== undefined ? data.rpm1 : 0),
+          rpm_2: data.rpm_2 !== undefined ? data.rpm_2 : 
+                 (data.rpm2 !== undefined ? data.rpm2 : 0),
+          rpm_3: data.rpm_3 !== undefined ? data.rpm_3 : 
+                 (data.rpm3 !== undefined ? data.rpm3 : 0),
+          timestamp: data.timestamp || Date.now() / 1000
+        };
+      }
+      
+      // Debug vì vấn đề
+      console.log("Processing encoder values:", values);
+      
+      // Update message buffer
+      messageBuffer.current.push({
+        type: 'encoder_data',
+        ...values,
+        original: data // Lưu trữ dữ liệu gốc
+      });
+      
+      // Cập nhật timestamp gần nhất
+      lastDataTimestamp.current = values.timestamp;
+      
+      // Tắt trạng thái loading
+      if (loading) {
         setLoading(false);
       }
-    };
+      
+      // Lên lịch cập nhật UI ngay lập tức
+      scheduleUIUpdate();
+      
+      // Tăng bộ đếm tin nhắn
+      messageCounter.current++;
+    }
+    // Có thể thêm xử lý các message types khác ở đây
+  } catch (err) {
+    console.error("Failed to parse WebSocket message:", err);
+    setError("Error processing data: " + (err instanceof Error ? err.message : String(err)));
+    setLoading(false);
+  }
+};
 
     setSocket(newSocket);
   }, [selectedRobotId, loading, scheduleUIUpdate, isConnected, setLiveUpdate]);
@@ -375,46 +422,60 @@ const EncoderDataWidget: React.FC = () => {
 
   // Toggle live updates
   const toggleLiveUpdate = useCallback(() => {
-    setLiveUpdate(prev => {
-      const newValue = !prev;
+  setLiveUpdate(prev => {
+    const newValue = !prev;
 
-      if (isConnected) {
-        if (newValue) {
-          console.log(`Subscribing to encoder updates for robot ${selectedRobotId}`);
-          sendMessage({
-            type: "subscribe_encoder"  // Subscribe command
-          });
-          
-          // Reset counters when starting live updates
-          messageCounter.current = 0;
-        } else {
-          console.log(`Unsubscribing from encoder updates for robot ${selectedRobotId}`);
-          sendMessage({
-            type: "unsubscribe_encoder"  // Unsubscribe command
-          });
-        }
+    if (isConnected) {
+      if (newValue) {
+        console.log(`Đăng ký nhận encoder data cho robot ${selectedRobotId}`);
+        sendMessage({
+          type: "subscribe_encoder", // Sửa từ direct_subscribe thành subscribe_encoder
+          robot_id: selectedRobotId
+        });
+      } else {
+        console.log(`Hủy đăng ký nhận encoder data cho robot ${selectedRobotId}`);
+        sendMessage({
+          type: "unsubscribe_encoder", // Sửa từ direct_unsubscribe thành unsubscribe_encoder
+          robot_id: selectedRobotId
+        });
       }
+    }
 
-      return newValue;
-    });
-  }, [isConnected, sendMessage, selectedRobotId]);
+    return newValue;
+  });
+}, [isConnected, sendMessage, selectedRobotId]);
 
   // Set up periodic UI update ticker
   useEffect(() => {
-    // Set up interval for checking if UI updates needed
-    const intervalId = setInterval(() => {
-      if (messageBuffer.current.length > 0) {
-        scheduleUIUpdate();
-      }
-    }, Math.floor(UI_UPDATE_INTERVAL / 2)); // Check slightly more often than update interval
-    
-    return () => {
-      clearInterval(intervalId);
-      if (animationFrameId.current !== null) {
-        cancelAnimationFrame(animationFrameId.current);
-      }
-    };
-  }, [scheduleUIUpdate]);
+  // Chỉnh sửa để interval chạy chính xác 1 giây 1 lần
+  const intervalId = setInterval(() => {
+    if (messageBuffer.current.length > 0) {
+      scheduleUIUpdate();
+    }
+  }, UI_UPDATE_INTERVAL);
+  
+  return () => {
+    clearInterval(intervalId);
+    if (animationFrameId.current !== null) {
+      cancelAnimationFrame(animationFrameId.current);
+    }
+  };
+}, [scheduleUIUpdate]);
+
+// Cập nhật UI thường xuyên hơn, bất kể có dữ liệu mới hay không
+useEffect(() => {
+  // Force update UI periodically
+  const intervalId = setInterval(() => {
+    if (liveUpdate && messageBuffer.current.length > 0) {
+      console.log("Forcing UI update...");
+      scheduleUIUpdate();
+    }
+  }, 200); // Check every 200ms
+  
+  return () => {
+    clearInterval(intervalId);
+  };
+}, [scheduleUIUpdate, liveUpdate]);
 
   // Clean up WebSocket connection on unmount or robot ID change
   useEffect(() => {
@@ -520,12 +581,14 @@ const EncoderDataWidget: React.FC = () => {
     },
     elements: {
       line: {
-        tension: 0.2 // Slight smoothing for better visuals
+        tension: 0.3, // Tăng độ mượt của đường
+        cubicInterpolationMode: 'monotone' as 'monotone', // Fix type with assertion
+        stepped: false // Đảm bảo không hiển thị kiểu bậc thang
       },
       point: {
-        radius: 2, // Default point size
-        hitRadius: 10, // Larger hit area for interaction
-        hoverRadius: 5, // Size when hovering
+        radius: 1, // Giảm kích thước điểm để biểu đồ trông mượt mà hơn
+        hitRadius: 10, 
+        hoverRadius: 5
       }
     },
     scales: {
@@ -580,6 +643,11 @@ const EncoderDataWidget: React.FC = () => {
       {`${messageCounter.current} msgs`}
     </span> : null;
 
+  // Thêm hàm để bật/tắt chế độ tạm dừng
+const togglePause = useCallback(() => {
+  setIsPaused(prev => !prev);
+}, []);
+
   return (
     <div className="flex flex-col h-full p-4">
       <WidgetConnectionHeader
@@ -615,13 +683,33 @@ const EncoderDataWidget: React.FC = () => {
           {liveUpdate ? (
             <>
               <Pause size={14} />
-              <span>Live: ON</span>
               {messageRate}
             </>
           ) : (
             <>
               <Play size={14} />
-              <span>Live: OFF</span>
+            </>
+          )}
+        </button>
+        
+        {/* Nút Pause mới */}
+        <button
+          onClick={togglePause}
+          disabled={!isConnected || !liveUpdate}
+          className={`px-3 py-1.5 rounded-md flex items-center gap-1 disabled:opacity-50 disabled:cursor-not-allowed
+                   ${isPaused 
+                     ? 'bg-amber-500 text-white hover:bg-amber-600' 
+                     : 'bg-gray-200 text-gray-800 hover:bg-gray-300'}`}
+        >
+          {isPaused ? (
+            <>
+              <Play size={14} />
+              <span>Resume</span>
+            </>
+          ) : (
+            <>
+              <Pause size={14} />
+              <span>Freeze Chart</span>
             </>
           )}
         </button>
@@ -690,6 +778,15 @@ const EncoderDataWidget: React.FC = () => {
                 <RotateCcw size={14} />
               </button>
               <span className="text-xs text-gray-500">Zoom: Cuộn chuột | Kéo: Di chuyển</span>
+            </div>
+            <div className="absolute bottom-2 right-2 flex gap-1">
+              <button
+                onClick={resetZoom}
+                className="p-1 bg-white rounded-md border border-gray-200 shadow-sm"
+                title="Reset Zoom"
+              >
+                <ZoomOut size={16} />
+              </button>
             </div>
           </div>
         ) : (

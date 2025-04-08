@@ -1456,6 +1456,30 @@ async def get_imu_data_since_timestamp(robot_id: str, since_timestamp: float):
             print(f"SQLAlchemy fallback error: {e2}")
             return []
 
+# Thêm hàm xử lý tin nhắn từ DirectBridge
+@app.websocket("/ws/{robot_id}")
+async def robot_endpoint(websocket: WebSocket, robot_id: str):
+    robot_id = ConnectionManager.normalize_robot_id(robot_id)
+    await handle_robot_connection(websocket, robot_id)
+
+# Đảm bảo khi có tin nhắn từ robot được chuyển tiếp từ DirectBridge,
+# nó sẽ được gửi đến tất cả các clients đang subscribe
+async def handle_robot_message(robot_id: str, message: dict):
+    # Forward to all clients subscribed to this robot
+    if robot_id in imu_subscribers and message.get('type') in ['bno055', 'imu', 'imu_data']:
+        for ws in imu_subscribers[robot_id]:
+            try:
+                await ws.send_json(message)
+            except Exception as e:
+                logger.error(f"Error forwarding IMU data: {e}")
+    
+    if robot_id in encoder_subscribers and message.get('type') in ['encoder', 'encoder_data']:
+        for ws in encoder_subscribers[robot_id]:
+            try:
+                await ws.send_json(message)
+            except Exception as e:
+                logger.error(f"Error forwarding encoder data: {e}")
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)

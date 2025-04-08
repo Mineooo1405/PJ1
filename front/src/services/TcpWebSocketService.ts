@@ -2,233 +2,203 @@ import { EventEmitter } from 'events';
 
 class TcpWebSocketService {
   private socket: WebSocket | null = null;
-  private events = new EventEmitter();
-  private connecting = false;
-  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
-  private reconnectAttempts = 0;
-  private url = '';
-  private robotId = 'robot1';
-  
+  private robotId: string = 'robot1';
+  private readonly wsUrl: string;
+  private connected: boolean = false;
+  private eventEmitter = new EventEmitter();
+  private reconnectInterval: any = null;
+  private messageHandlers: Record<string, Function[]> = {};
+  private connectionChangeHandlers: Function[] = [];
+
   constructor() {
-    this.events.setMaxListeners(20);
+    // Kết nối trực tiếp đến DirectBridge WebSocket, không qua FastAPI
+    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    this.wsUrl = `${protocol}//localhost:9003/ws/`;
   }
 
-  setRobotId(robotId: string) {
-    this.robotId = robotId;
-    
-    // Reconnect if already connected
-    if (this.isConnected()) {
-      this.disconnect();
-      setTimeout(() => this.connect(), 500);
+  public connect(): boolean {
+    if (this.socket && (this.socket.readyState === WebSocket.CONNECTING || this.socket.readyState === WebSocket.OPEN)) {
+      console.log('Already connected or connecting');
+      return false;
     }
-  }
 
-  connect() {
-    // Clear any existing reconnect timer
-    if (this.reconnectTimer) {
-      clearTimeout(this.reconnectTimer);
-      this.reconnectTimer = null;
-    }
-    
-    // If already connected or connecting, do nothing
-    if (this.socket && (this.socket.readyState === WebSocket.OPEN || this.socket.readyState === WebSocket.CONNECTING)) {
-      console.log('WebSocket is already connected or connecting');
-      return;
-    }
-    
-    if (this.connecting) {
-      console.log('Connection already in progress');
-      return;
-    }
-    
-    this.connecting = true;
-    
     try {
-      // Connect to direct_bridge WebSocket server
-      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const host = window.location.hostname || 'localhost';
-      const port = 9003; // direct_bridge WebSocket port
-      
-      this.url = `${protocol}//${host}:${port}/ws/${this.robotId}`;
-      
-      console.log(`Connecting to direct_bridge WebSocket at ${this.url}`);
-      this.socket = new WebSocket(this.url);
-      
+      const fullUrl = `${this.wsUrl}${this.robotId}`;
+      console.log(`Connecting to DirectBridge WebSocket at ${fullUrl}`);
+      this.socket = new WebSocket(fullUrl);
+
       this.socket.onopen = () => {
-        console.log('WebSocket connection to direct_bridge established');
-        this.connecting = false;
-        this.reconnectAttempts = 0;
-        this.events.emit('connectionChange', true);
+        console.log('DirectBridge WebSocket connection established');
+        this.connected = true;
+        this._notifyConnectionChange(true);
         
-        // Send identification message
+        // Gửi xác nhận đăng ký để nhận dữ liệu trực tiếp
         this.sendMessage({
-          type: 'registration',
-          robot_id: this.robotId,
-          client_type: 'frontend'
+          type: 'client_registration',
+          client_type: 'web_frontend',
+          timestamp: Date.now() / 1000
         });
       };
-      
+
       this.socket.onclose = (event) => {
-        console.log(`WebSocket connection closed: ${event.code} - ${event.reason}`);
-        this.connecting = false;
-        this.socket = null;
-        this.events.emit('connectionChange', false);
+        console.log(`DirectBridge WebSocket connection closed: ${event.code} ${event.reason}`);
+        this.connected = false;
+        this._notifyConnectionChange(false);
         
-        // Always try to reconnect unless it was a manual disconnect
-        if (event.reason !== 'Manual disconnect') {
-          this.scheduleReconnect();
+        // Thiết lập kết nối lại sau 5 giây
+        if (!this.reconnectInterval) {
+          this.reconnectInterval = setInterval(() => {
+            if (!this.connected) {
+              this.connect();
+            } else {
+              clearInterval(this.reconnectInterval);
+              this.reconnectInterval = null;
+            }
+          }, 5000);
         }
       };
-      
-      this.socket.onerror = (error) => {
-        console.error('WebSocket error:', error);
-        this.connecting = false;
-        this.events.emit('connectionChange', false);
-        
-        // If there's an error, close the socket to trigger reconnect via onclose
-        if (this.socket) {
-          this.socket.close();
-        }
+
+      this.socket.onerror = (event) => {
+        console.error('DirectBridge WebSocket error:', event);
       };
-      
+
       this.socket.onmessage = (event) => {
         try {
-          const data = JSON.parse(event.data);
-          console.log('Received WebSocket message:', data);
+          const message = JSON.parse(event.data);
+          console.debug('Received message from DirectBridge:', message);
           
-          // Forward message to listeners
-          this.events.emit('message', data);
+          // Phân phối tin nhắn tới các handlers dựa trên message.type
+          const messageType = message.type || 'unknown';
+          this._notifyHandlers(messageType, message);
           
-          // Also emit based on message type if available
-          if (data.type) {
-            this.events.emit(`message:${data.type}`, data);
-          }
-        } catch (error) {
-          console.error('Error parsing WebSocket message:', error);
+          // Thông báo cho tất cả các handlers '*' (catch-all)
+          this._notifyHandlers('*', message);
+        } catch (err) {
+          console.error('Failed to parse message:', err, event.data);
         }
       };
-    } catch (error) {
-      console.error('Error creating WebSocket connection:', error);
-      this.connecting = false;
-      this.events.emit('connectionChange', false);
-      this.scheduleReconnect();
+
+      return true;
+    } catch (err) {
+      console.error('Error connecting to DirectBridge:', err);
+      return false;
     }
   }
-  
-  disconnect() {
-    if (this.reconnectTimer) {
-      clearTimeout(this.reconnectTimer);
-      this.reconnectTimer = null;
-    }
-    
+
+  public disconnect(): void {
     if (this.socket) {
-      // Use manual disconnect reason to avoid auto reconnect
-      this.socket.close(1000, 'Manual disconnect');
+      this.socket.close();
       this.socket = null;
-    }
-  }
-  
-  isConnected(): boolean {
-    return this.socket !== null && this.socket.readyState === WebSocket.OPEN;
-  }
-  
-  private scheduleReconnect() {
-    if (this.reconnectTimer) {
-      clearTimeout(this.reconnectTimer);
+      this.connected = false;
     }
     
-    // Exponential backoff with max delay of 30 seconds
-    this.reconnectAttempts++;
-    const delay = Math.min(Math.pow(1.5, Math.min(this.reconnectAttempts, 10)) * 1000, 30000);
-    
-    console.log(`Scheduling reconnect attempt ${this.reconnectAttempts} in ${delay}ms`);
-    
-    this.reconnectTimer = setTimeout(() => {
-      console.log('Attempting to reconnect...');
-      this.connect();
-    }, delay);
+    if (this.reconnectInterval) {
+      clearInterval(this.reconnectInterval);
+      this.reconnectInterval = null;
+    }
   }
-  
-  sendMessage(message: any): boolean {
-    if (!this.isConnected()) {
-      console.error('Cannot send message, WebSocket is not connected');
-      // Try to reconnect
-      this.connect();
+
+  public isConnected(): boolean {
+    return this.connected && this.socket !== null && this.socket.readyState === WebSocket.OPEN;
+  }
+
+  public setRobotId(robotId: string): void {
+    if (robotId !== this.robotId) {
+      const wasConnected = this.isConnected();
+      if (wasConnected) {
+        this.disconnect();
+      }
+      
+      this.robotId = robotId;
+      
+      if (wasConnected) {
+        this.connect();
+      }
+    }
+  }
+
+  public sendMessage(message: any): boolean {
+    if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
+      console.warn('Cannot send message: Socket not connected');
       return false;
     }
     
     try {
-      // Add robot_id and timestamp if not already present
-      if (!message.robot_id) {
-        message.robot_id = this.robotId;
-      }
-      
-      if (!message.timestamp) {
-        message.timestamp = Date.now() / 1000;
-      }
-      
-      // Clone the message before stringifying to avoid circular references
-      const messageCopy = JSON.parse(JSON.stringify(message));
-      
-      this.socket!.send(JSON.stringify(messageCopy));
-      console.log('Sent message:', messageCopy);
+      this.socket.send(JSON.stringify(message));
       return true;
-    } catch (error) {
-      console.error('Error sending WebSocket message:', error);
-      
-      // If there's an error while sending, the connection might be broken
-      // Close the socket to trigger reconnect
-      if (this.socket) {
-        this.socket.close();
-        this.socket = null;
-      }
-      
+    } catch (err) {
+      console.error('Error sending message:', err);
       return false;
     }
   }
-  
-  // Send PID configuration directly to robot via direct_bridge
-  sendPidConfig(robotId: string, motorId: number, pidValues: any): boolean {
+
+  public sendPidConfig(robotId: string, motorId: number, pidValues: { kp: number, ki: number, kd: number }): boolean {
     return this.sendMessage({
       type: 'pid_config',
       robot_id: robotId,
       motor_id: motorId,
       kp: pidValues.kp,
       ki: pidValues.ki,
-      kd: pidValues.kd
+      kd: pidValues.kd,
+      timestamp: Date.now() / 1000
     });
   }
-  
-  // Event listeners
-  onMessage(type: string | 'message', callback: (data: any) => void) {
-    if (type === 'message') {
-      this.events.on('message', callback);
-    } else {
-      this.events.on(`message:${type}`, callback);
+
+  public onMessage(messageType: string, handler: Function): void {
+    if (!this.messageHandlers[messageType]) {
+      this.messageHandlers[messageType] = [];
     }
-    return this;
-  }
-  
-  offMessage(type: string | 'message', callback: (data: any) => void) {
-    if (type === 'message') {
-      this.events.off('message', callback);
-    } else {
-      this.events.off(`message:${type}`, callback);
+    
+    if (!this.messageHandlers[messageType].includes(handler)) {
+      this.messageHandlers[messageType].push(handler);
     }
-    return this;
   }
-  
-  onConnectionChange(callback: (connected: boolean) => void) {
-    this.events.on('connectionChange', callback);
-    return this;
+
+  public offMessage(messageType: string, handler: Function): void {
+    if (this.messageHandlers[messageType]) {
+      const index = this.messageHandlers[messageType].indexOf(handler);
+      if (index !== -1) {
+        this.messageHandlers[messageType].splice(index, 1);
+      }
+    }
   }
-  
-  offConnectionChange(callback: (connected: boolean) => void) {
-    this.events.off('connectionChange', callback);
-    return this;
+
+  public onConnectionChange(handler: Function): void {
+    if (!this.connectionChangeHandlers.includes(handler)) {
+      this.connectionChangeHandlers.push(handler);
+    }
+  }
+
+  public offConnectionChange(handler: Function): void {
+    const index = this.connectionChangeHandlers.indexOf(handler);
+    if (index !== -1) {
+      this.connectionChangeHandlers.splice(index, 1);
+    }
+  }
+
+  private _notifyConnectionChange(isConnected: boolean): void {
+    this.connectionChangeHandlers.forEach(handler => {
+      try {
+        handler(isConnected);
+      } catch (err) {
+        console.error('Error in connection change handler:', err);
+      }
+    });
+  }
+
+  private _notifyHandlers(messageType: string, data: any): void {
+    if (this.messageHandlers[messageType]) {
+      this.messageHandlers[messageType].forEach(handler => {
+        try {
+          handler(data);
+        } catch (err) {
+          console.error(`Error in message handler for ${messageType}:`, err);
+        }
+      });
+    }
   }
 }
 
-// Create a singleton instance
+// Khởi tạo và export singleton instance
 const tcpWebSocketService = new TcpWebSocketService();
 export default tcpWebSocketService;
