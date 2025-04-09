@@ -4,12 +4,16 @@ import asyncio
 import websockets
 import json
 import logging
+import base64
 from connection_manager import ConnectionManager
 import aiohttp
 import time
 from datetime import datetime
 from high_performance_db import db_writer
 from aiohttp import web
+from aiohttp.web import middleware
+from aiohttp.web_request import Request
+from aiohttp.web_response import Response
 import argparse
 
 # Configure logging
@@ -109,6 +113,65 @@ class APIBatchSender:
             except Exception as e:
                 logger.error(f"Error sending batch to API: {e}")
 
+# Thêm hỗ trợ kết nối OTA
+
+class OTAConnection:
+    def __init__(self):
+        self.connections = {}  # Map robot_id -> (reader, writer)
+        self.ip_connections = {}  # Map ip_address:port -> (reader, writer)
+    
+    async def connect(self, ip_address, port, robot_id):
+        """Connect to OTA endpoint for firmware update or data"""
+        key = f"{ip_address}:{port}"
+        ota_type = "OTA0" if port == 12345 else "OTA1" if port == 12346 else "Unknown"
+        
+        try:
+            logger.info(f"Connecting to {ota_type} at {ip_address}:{port} for {robot_id}")
+            
+            # Clear existing connection if any
+            if robot_id in self.connections:
+                _, writer = self.connections[robot_id]
+                writer.close()
+                try:
+                    await writer.wait_closed()
+                except Exception as e:
+                    logger.error(f"Error closing previous connection: {e}")
+            
+            # Create new connection
+            reader, writer = await asyncio.open_connection(ip_address, port)
+            logger.info(f"Connected to {ota_type} at {ip_address}:{port}")
+            
+            # Store connections
+            self.connections[robot_id] = (reader, writer)
+            self.ip_connections[key] = (reader, writer)
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error connecting to {ota_type} at {ip_address}:{port}: {e}")
+            return False
+    
+    def get_connection(self, robot_id=None, ip_address=None, port=None):
+        """
+        Get a connection by robot_id or by ip_address and port
+        
+        Args:
+            robot_id: The ID of the robot to get the connection for
+            ip_address: The IP address to get the connection for
+            port: The port to get the connection for (required if ip_address is provided)
+            
+        Returns:
+            The connection tuple (reader, writer) or None if not found
+        """
+        if robot_id is not None:
+            return self.connections.get(robot_id)
+            
+        if ip_address is not None and port is not None:
+            key = f"{ip_address}:{port}"
+            return self.ip_connections.get(key)
+            
+        return None
+
 class DirectBridge:
     def __init__(self, tcp_port=TCP_PORT, ws_port=WS_PORT):
         self.tcp_port = tcp_port
@@ -116,6 +179,7 @@ class DirectBridge:
         self.tcp_server = None
         self.ws_server = None
         self.running = False
+        self.ota_connection = OTAConnection()  # Đổi tên
     
     async def start(self):
         """Start both TCP and WebSocket servers"""
@@ -278,6 +342,7 @@ class DirectBridge:
                     try:
                         # Parse the incoming message
                         data = json.loads(message)
+                        logger.debug(f"Received message from WebSocket: {data}")
                         
                         # Xử lý lệnh đăng ký trực tiếp
                         if data.get("type") == "direct_subscribe":
@@ -312,6 +377,135 @@ class DirectBridge:
                             }))
                             continue
                         
+                        # Xử lý lệnh connect_ota0
+                        if data.get("type") == "connect_ota0":
+                            ip_address = data.get("ip_address")
+                            port = data.get("port", 12345)  # Mặc định OTA0 port cho firmware
+                            robot_id = data.get("robot_id")
+                            
+                            # Xác định loại OTA dựa trên port
+                            ota_type = "OTA0" if port == 12345 else "OTA1" if port == 12346 else "Unknown"
+                            
+                            if not ip_address or not robot_id:
+                                await websocket.send(json.dumps({
+                                    "type": "ota0_connection_response",
+                                    "status": "error",
+                                    "message": "Missing IP address or robot_id"
+                                }))
+                                continue
+                            
+                            # Kết nối tới OTA endpoint
+                            success = await self.ota_connection.connect(ip_address, port, robot_id)
+                            
+                            if success:
+                                await websocket.send(json.dumps({
+                                    "type": "ota0_connection_response",
+                                    "status": "connected",
+                                    "robot_id": robot_id,
+                                    "ip_address": ip_address,
+                                    "port": port,
+                                    "ota_type": ota_type,
+                                    "timestamp": time.time()
+                                }))
+                            else:
+                                await websocket.send(json.dumps({
+                                    "type": "ota0_connection_response",
+                                    "status": "error",
+                                    "message": f"Could not connect to {ota_type} at {ip_address}:{port}",
+                                    "timestamp": time.time()
+                                }))
+                            continue
+                        
+                        # Xử lý lệnh disconnect_ota0
+                        elif data.get("type") == "disconnect_ota0":
+                            ip_address = data.get("ip_address")
+                            port = data.get("port", 12345)
+                            robot_id = data.get("robot_id")
+                            
+                            if not robot_id and not ip_address:
+                                await websocket.send(json.dumps({
+                                    "type": "ota0_connection_response",
+                                    "status": "error",
+                                    "message": "Missing robot_id or IP address"
+                                }))
+                                continue
+                            
+                            # Ngắt kết nối OTA0
+                            success = await self.ota_connection.disconnect(robot_id, ip_address, port)
+                            
+                            await websocket.send(json.dumps({
+                                "type": "ota0_connection_response",
+                                "status": "disconnected",
+                                "robot_id": robot_id,
+                                "timestamp": time.time()
+                            }))
+                            continue
+                        
+                        # Xử lý lệnh liên quan đến firmware update qua OTA
+                        elif data.get("type").startswith("firmware_"):
+                            robot_id = data.get("robot_id")
+                            target_ip = data.get("target_ip")
+                            target_port = data.get("target_port", 12345)
+                            binary_format = data.get("binary_format", False)
+                            
+                            # Xử lý firmware chunk đặc biệt nếu có dữ liệu binary
+                            if data.get("type") == "firmware_chunk" and binary_format:
+                                chunk_data = data.get("data", "")
+                                chunk_index = data.get("chunk_index", -1)
+                                total_chunks = data.get("total_chunks", -1)
+                                
+                                if chunk_data:
+                                    try:
+                                        # Giải mã base64 thành dữ liệu nhị phân
+                                        binary_data = base64.b64decode(chunk_data)
+                                        
+                                        # Log kích thước chunk
+                                        logger.info(f"Processing firmware chunk {chunk_index+1}/{total_chunks} - Size: {len(binary_data)} bytes")
+                                        
+                                        # Lưu chunk để kiểm tra (tùy chọn)
+                                        if chunk_index == 0 or chunk_index % 100 == 0:
+                                            with open(f"chunk_{chunk_index}.bin", "wb") as f:
+                                                f.write(binary_data)
+                                            logger.info(f"Saved chunk {chunk_index} for inspection")
+                                        
+                                        # Lấy kết nối OTA
+                                        connection = self.ota_connection.get_connection(
+                                            robot_id=robot_id, 
+                                            ip_address=target_ip, 
+                                            port=target_port
+                                        )
+                                        
+                                        if connection:
+                                            _, writer = connection
+                                            
+                                            # Gửi dữ liệu nhị phân trực tiếp đến ESP32
+                                            writer.write(binary_data)
+                                            await writer.drain()
+                                            
+                                            # Gửi phản hồi thành công
+                                            await websocket.send(json.dumps({
+                                                "type": "firmware_response",
+                                                "status": "success",
+                                                "chunk_index": data.get("chunk_index"),
+                                                "timestamp": time.time()
+                                            }))
+                                        else:
+                                            await websocket.send(json.dumps({
+                                                "type": "firmware_response",
+                                                "status": "error",
+                                                "message": "Không tìm thấy kết nối OTA",
+                                                "timestamp": time.time()
+                                            }))
+                                    except Exception as e:
+                                        logger.error(f"Lỗi khi xử lý firmware chunk: {e}")
+                                        await websocket.send(json.dumps({
+                                            "type": "firmware_response",
+                                            "status": "error",
+                                            "message": f"Lỗi khi xử lý firmware chunk: {str(e)}",
+                                            "timestamp": time.time()
+                                        }))
+                                continue
+                        
                         # Xử lý các lệnh khác như trước
                         # ...
                         
@@ -333,55 +527,33 @@ class DirectBridge:
             logger.info(f"WebSocket connection closed for {websocket.remote_address}")
 
     async def send_firmware_by_ip(self, ip, firmware_data, port=None):
-        """
-        Gửi firmware đến robot bằng địa chỉ IP
+        """Send firmware to robot by IP address"""
+        logger.info(f"🔍 Sending firmware to IP {ip}" + (f":{port}" if port else ""))
         
-        Args:
-            ip (str): Địa chỉ IP của robot
-            firmware_data (dict): Dữ liệu firmware cần gửi
-            port (int, optional): Port nếu chỉ định
+        # Get or create OTA2 connection
+        if not await self.ota_connection.connect(ip, port or 12345, "temp_id"):
+            return {"status": "error", "message": "Failed to connect to OTA2 endpoint"}
+        
+        # Get the connection
+        connection = self.ota_connection.get_connection(ip_address=ip, port=port or 12345)
+        if not connection:
+            return {"status": "error", "message": "OTA2 connection not available"}
             
-        Returns:
-            dict: Kết quả của thao tác gửi firmware
-        """
-        logger.info(f"🔍 Tìm kiếm kết nối TCP cho IP {ip}" + (f":{port}" if port else ""))
-        
-        tcp_client = ConnectionManager.get_tcp_client_by_addr(ip, port)
-        if not tcp_client:
-            error_msg = f"❌ Không tìm thấy robot với IP {ip}" + (f":{port}" if port else "")
-            logger.error(error_msg)
-            return {"status": "error", "message": error_msg}
+        reader, writer = connection
         
         try:
-            reader, writer = tcp_client
-            
-            # Lấy thông tin robot_id
-            robot_id = ConnectionManager.get_robot_id_by_ip(ip, port)
-            
-            # Chuẩn bị dữ liệu firmware
-            firmware_data["sent_by_ip"] = True
-            firmware_data["target_ip"] = ip
-            if port:
-                firmware_data["target_port"] = port
-            
-            # Gửi firmware qua TCP
-            writer.write((json.dumps(firmware_data) + "\n").encode())
-            await writer.drain()
-            
-            logger.info(f"✅ Đã gửi {firmware_data.get('type', 'firmware')} đến robot {robot_id} tại {ip}" + (f":{port}" if port else ""))
-            
-            # Phản hồi thành công
-            return {
-                "status": "success", 
-                "message": f"Đã gửi firmware đến robot tại {ip}" + (f":{port}" if port else ""),
-                "robot_id": robot_id,
-                "ip": ip,
-                "port": port
-            }
+            # Send firmware data
+            chunk_data = firmware_data.get("data", "")
+            if chunk_data:
+                # Decode base64 data
+                binary_data = base64.b64decode(chunk_data)
+                writer.write(binary_data)
+                await writer.drain()
+                
+            return {"status": "success", "message": "Firmware chunk sent successfully"}
         except Exception as e:
-            error_msg = f"❌ Lỗi gửi firmware đến robot tại {ip}" + (f":{port}" if port else "") + f": {e}"
-            logger.error(error_msg)
-            return {"status": "error", "message": error_msg}
+            logger.error(f"Error sending firmware: {e}")
+            return {"status": "error", "message": f"Failed to send firmware: {str(e)}"}
 
     async def send_to_robot(self, robot_id, data):
         tcp_client = ConnectionManager.get_tcp_client(robot_id)
@@ -644,6 +816,24 @@ async def list_connections(request):
             "timestamp": time.time()
         }, status=500)
 
+@middleware
+async def cors_middleware(request: Request, handler):
+    # Handle CORS preflight requests
+    if request.method == 'OPTIONS':
+        headers = {
+            'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+            'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+            'Access-Control-Max-Age': '3600'
+        }
+        return web.Response(status=204, headers=headers)
+    
+    response = await handler(request)
+    
+    # Add CORS headers to all responses
+    response.headers['Access-Control-Allow-Origin'] = '*'
+    return response
+
 # Main function
 async def main():
     # Khởi tạo các tham số từ command line
@@ -669,7 +859,7 @@ async def main():
     
     # Tạo và khởi động API server
     logger.info(f"Khởi động API server trên port {args.api_port}...")
-    app = web.Application()
+    app = web.Application(middlewares=[cors_middleware])
     app.add_routes(routes)  # routes đã được định nghĩa trước đó
     
     # Khởi động API server

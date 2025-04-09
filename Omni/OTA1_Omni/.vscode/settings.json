@@ -1,0 +1,24 @@
+{
+    "C_Cpp.intelliSenseEngine": "default",
+    "idf.espIdfPathWin": "d:\\IDF\\esp-idf\\v5.2.2\\esp-idf",
+    "idf.openOcdConfigs": [
+        "board/esp32-wrover-kit-3.3v.cfg"
+    ],
+    "idf.toolsPathWin": "D:\\APP\\Espressif",
+    "files.associations": {
+        "task.h": "c",
+        "system_error": "c",
+        "esp_partition.h": "c",
+        "nvs_flash.h": "c",
+        "esp_log.h": "c",
+        "sockets.h": "c",
+        "stdio.h": "c",
+        "omni_control.h": "c",
+        "pulse_cnt.h": "c",
+        "*.tcc": "c",
+        "chrono": "c",
+        "mutex": "c"
+    },
+    "idf.portWin": "COM4",
+    "idf.flashType": "UART"
+}

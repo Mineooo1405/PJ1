@@ -12,3 +12,7 @@ lệnh chạy fastapi uvicorn main:app --reload(lệnh này dùng để reload t
 uvicorn main:app --reload --host 0.0.0.0 --port 8000
 
 pip install python-dotenv
+
+cd back
+python test_data_sender.py --type bno055 --file "../json_data/imu_data_20250328_101150.json" --robot robot1 --delay 0.05
+python test_data_sender.py --type encoder --file "../json_data/encoder_data_20250328_101150.json" --robot robot1 --delay 0.05

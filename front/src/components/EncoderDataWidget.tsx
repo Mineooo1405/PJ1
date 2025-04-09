@@ -1,5 +1,5 @@
-import React, { useState, useEffect, useCallback, useRef } from 'react';
-import { RefreshCw, Play, Pause, RotateCcw, Download, ZoomIn, ZoomOut, Move } from 'lucide-react';
+import React, { useState, useEffect, useCallback, useRef, useContext } from 'react';
+import { RefreshCw, Play, Pause, RotateCcw, Download, ZoomIn, ZoomOut, Move, AlertCircle } from 'lucide-react';
 import WidgetConnectionHeader from './WidgetConnectionHeader';
 import { useRobotContext } from './RobotContext';
 import { Line } from 'react-chartjs-2';
@@ -14,6 +14,7 @@ import {
   Legend
 } from 'chart.js';
 import zoomPlugin from 'chartjs-plugin-zoom'; // Thêm import cho plugin zoom
+import { GlobalAppContext } from '../contexts/GlobalAppContext';
 
 // Register Chart.js components
 ChartJS.register(
@@ -53,6 +54,7 @@ interface EncoderData {
 
 const EncoderDataWidget: React.FC = () => {
   const { selectedRobotId } = useRobotContext();
+  const { firmwareUpdateMode } = useContext(GlobalAppContext);
   
   // WebSocket connection state
   const [socket, setSocket] = useState<WebSocket | null>(null);
@@ -647,6 +649,31 @@ useEffect(() => {
 const togglePause = useCallback(() => {
   setIsPaused(prev => !prev);
 }, []);
+
+  // Cập nhật UI để hiển thị thông báo khi đang trong chế độ firmware update
+  if (firmwareUpdateMode) {
+    return (
+      <div className="flex flex-col h-full p-4">
+        <WidgetConnectionHeader
+          title={`Encoder Data (${selectedRobotId})`}
+          status="disconnected"
+          isConnected={false}
+          onConnect={() => {}}
+          onDisconnect={() => {}}
+        />
+        
+        <div className="flex-grow flex items-center justify-center bg-gray-50 rounded-lg border border-dashed border-gray-300">
+          <div className="text-center p-6">
+            <AlertCircle size={32} className="text-yellow-500 mx-auto mb-2" />
+            <h3 className="text-lg font-medium text-gray-700">Cập Nhật Firmware Đang Diễn Ra</h3>
+            <p className="text-gray-500 mt-1">
+              Dữ liệu encoder tạm thời không khả dụng trong quá trình cập nhật firmware.
+            </p>
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="flex flex-col h-full p-4">

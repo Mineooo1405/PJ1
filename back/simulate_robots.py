@@ -4,6 +4,7 @@ import time
 import random
 import threading
 import select
+import sys
 
 def send_message(sock, data):
     message = json.dumps(data) + "\n"  # Ensure newline character
@@ -157,32 +158,113 @@ def receive_messages(sock, robot_id, stop_event):
             stop_event.set()
             break
 
-def robot_client(robot_id):
+def firmware_server(robot_id, port=12345):
+    """Thread function to listen for firmware updates on a specific port"""
+    print(f"Starting firmware OTA server for {robot_id} on port {port}")
     try:
-        # Connect to server
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.connect(('localhost', 9000))
+        # Tạo socket lắng nghe
+        server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server_sock.bind(('0.0.0.0', port))
+        server_sock.listen(1)
+        print(f"{robot_id}: OTA0 server listening on port {port}")
         
-        print(f"{robot_id}: Connected to TCP server")
+        while True:
+            try:
+                # Chấp nhận kết nối
+                client_sock, addr = server_sock.accept()
+                print(f"{robot_id}: Firmware update connection from {addr}")
+                
+                # Nhận và xử lý dữ liệu firmware
+                total_bytes = 0
+                chunks_received = 0
+                
+                while True:
+                    chunk = client_sock.recv(1024)
+                    if not chunk:
+                        break
+                    
+                    # Mô phỏng xử lý chunk
+                    chunks_received += 1
+                    total_bytes += len(chunk)
+                    
+                    # In tiến trình
+                    print(f"\r{robot_id}: Received {chunks_received} chunks, {total_bytes} bytes", end="")
+                    
+                    # Đánh dấu là đã nhận được firmware
+                    firmware_request_detected = False
+                
+                print(f"\n{robot_id}: Firmware update complete, received {total_bytes} bytes")
+                client_sock.close()
+            except Exception as e:
+                print(f"{robot_id}: Error in firmware connection: {e}")
+                if 'client_sock' in locals():
+                    client_sock.close()
+                # Tiếp tục lắng nghe kết nối mới
+    except Exception as e:
+        print(f"{robot_id}: Fatal error in firmware server: {e}")
+    finally:
+        if 'server_sock' in locals():
+            server_sock.close()
+        print(f"{robot_id}: OTA0 server stopped")
 
-        # First send registration message - giữ nguyên định dạng này để tương thích
-        registration = {"type": "registration", "robot_id": robot_id}
-        send_message(sock, registration)
+def robot_client(robot_id, firmware_mode=False):
+    try:
+        # Kết nối OTA1 cho dữ liệu (encoder, IMU, etc.)
+        data_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        data_sock.connect(('localhost', 9000))  # Kết nối tới port chính của DirectBridge
+        print(f"{robot_id}: Connected to TCP server on port 9000")
 
-        # Create a stop event for graceful thread termination
-        stop_event = threading.Event()
-        
-        # Start a thread for receiving messages
-        receive_thread = threading.Thread(
+        # Đăng ký cho data socket
+        registration = {"type": "registration", "robot_id": robot_id, "service": "data"}
+        send_message(data_sock, registration)
+
+        # Tạo thread xử lý nhận tin nhắn
+        data_stop_event = threading.Event()
+        data_thread = threading.Thread(
             target=receive_messages, 
-            args=(sock, robot_id, stop_event),
+            args=(data_sock, f"{robot_id}_data", data_stop_event),
             daemon=True
         )
-        receive_thread.start()
-        print(f"{robot_id}: Started receive thread")
+        data_thread.start()
 
-        # Wait for registration to complete
-        time.sleep(1)
+        # Nếu firmware_mode = True, kích hoạt ngay firmware socket
+        firmware_sock = None
+        firmware_stop_event = threading.Event()
+        firmware_request_detected = firmware_mode  # Sử dụng trực tiếp tham số
+
+        # Khởi tạo firmware socket ngay nếu firmware_mode = True
+        if firmware_mode:
+            try:
+                print(f"{robot_id}: Starting firmware server for OTA0...")
+                # Tạo thread riêng để lắng nghe kết nối firmware
+                firmware_server_thread = threading.Thread(
+                    target=firmware_server,
+                    args=(robot_id, 12345),  # Port 12345 cho OTA0
+                    daemon=True
+                )
+                firmware_server_thread.start()
+                
+                # Đăng ký dịch vụ firmware với DirectBridge
+                firmware_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                firmware_sock.connect(('localhost', 9000))  # Kết nối tới DirectBridge
+                print(f"{robot_id}: Connected firmware registration socket to DirectBridge")
+                
+                # Đăng ký firmware socket
+                fw_registration = {"type": "registration", "robot_id": robot_id, "service": "firmware"}
+                send_message(firmware_sock, fw_registration)
+                
+                # Thread xử lý tin nhắn firmware
+                firmware_thread = threading.Thread(
+                    target=receive_messages, 
+                    args=(firmware_sock, f"{robot_id}_firmware", firmware_stop_event),
+                    daemon=True
+                )
+                firmware_thread.start()
+                print(f"{robot_id}: Firmware registration complete!")
+            except Exception as e:
+                print(f"Error setting up firmware service: {e}")
+                firmware_sock = None
         
         # Main loop - send data periodically
         try:
@@ -191,15 +273,14 @@ def robot_client(robot_id):
             last_imu_send = time.time()
             
             # Target frequencies
-            encoder_interval = 0.020  # 50Hz (every 20ms)
-            imu_interval = 0.050      # 20Hz (every 50ms)
+            encoder_interval = 1  # 50Hz (every 20ms)
+            imu_interval = 1      # 20Hz (every 50ms)
             
-            while not stop_event.is_set():
+            while not data_stop_event.is_set():
                 current_time = time.time()
                 
-                # Send encoder data at target frequency
+                # Gửi encoder, IMU data qua data_sock (OTA1)
                 if current_time - last_encoder_send >= encoder_interval:
-                    # Format mới cho encoder data
                     encoder_data = {
                         "id": robot_id,  # Đổi từ robot_id thành id
                         "type": "encoder",
@@ -209,12 +290,10 @@ def robot_client(robot_id):
                             random.uniform(-30, 30)   # rpm3
                         ]
                     }
-                    send_message(sock, encoder_data)
+                    send_message(data_sock, encoder_data)
                     last_encoder_send = current_time
                 
-                # Send IMU data at target frequency
                 if current_time - last_imu_send >= imu_interval:
-                    # Format mới cho IMU data
                     imu_data = {
                         "id": robot_id,  # Đổi từ robot_id thành id
                         "type": "bno055",  # Đổi từ imu thành bno055
@@ -233,7 +312,7 @@ def robot_client(robot_id):
                             ]
                         }
                     }
-                    send_message(sock, imu_data)
+                    send_message(data_sock, imu_data)
                     last_imu_send = current_time
                 
                 # Sleep a short time to avoid CPU spinning
@@ -243,9 +322,14 @@ def robot_client(robot_id):
             print(f"{robot_id}: Closing connection...")
         finally:
             # Signal the receive thread to stop
-            stop_event.set()
-            sock.close()
-            receive_thread.join(timeout=2.0)
+            data_stop_event.set()
+            if firmware_sock:
+                firmware_stop_event.set()
+                firmware_sock.close()
+            data_sock.close()
+            data_thread.join(timeout=2.0)
+            if firmware_sock:
+                firmware_thread.join(timeout=2.0)
             
     except Exception as e:
         print(f"{robot_id}: Error - {str(e)}")
@@ -254,14 +338,19 @@ def robot_client(robot_id):
 if __name__ == "__main__":
     robots = ["robot1"]
     threads = []
+    
+    # Kiểm tra xem có flag firmware hay không
+    firmware_mode = "--firmware" in sys.argv
    
     try:
         for robot_id in robots:
-            thread = threading.Thread(target=robot_client, args=(robot_id,))
+            # Truyền biến firmware_mode vào hàm robot_client
+            thread = threading.Thread(target=robot_client, args=(robot_id, firmware_mode))
             thread.daemon = True
             threads.append(thread)
             thread.start()
-            print(f"Started thread for {robot_id}")
+            print(f"Started thread for {robot_id}" + 
+                  (" (FIRMWARE MODE - OTA0 listening on port 12345)" if firmware_mode else ""))
             time.sleep(1)  # Stagger connections
         
         # Keep main thread running

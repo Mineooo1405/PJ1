@@ -9,7 +9,7 @@ import { PlusCircle, Layers, Settings, MonitorSmartphone, ActivitySquare,
          WifiOff, Code, ChevronLeft, ChevronRight, Cpu, BarChart3, Activity, Gamepad } from "lucide-react";
 import DraggableWidget from "./components/DraggableWidget";
 import TCPServerStatusButton from './components/TCPServerStatusButton';
-
+import { GlobalAppProvider } from "./contexts/GlobalAppContext";
 
 // Widget option definition
 interface WidgetOption {
@@ -300,7 +300,8 @@ const App: React.FC = () => {
   }, []);
 
   return (
-    <DndProvider backend={HTML5Backend}>
+    <GlobalAppProvider>
+      <DndProvider backend={HTML5Backend}>
         <RobotProvider>
           <div className="w-screen h-screen flex flex-col bg-gray-100 overflow-hidden">
             {/* Header Bar */}
@@ -460,7 +461,8 @@ const App: React.FC = () => {
             )}
           </div>  
         </RobotProvider>
-    </DndProvider>
+      </DndProvider>
+    </GlobalAppProvider>
   );
 };
 

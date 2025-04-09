@@ -1,18 +1,36 @@
-import React, { useState, useRef, useEffect } from "react";
-import { Upload, AlertCircle, Check, RefreshCw, Wifi, Network } from "lucide-react";
+import React, { useState, useRef, useEffect, useContext } from "react";
+import { Upload, AlertCircle, Check, RefreshCw, Wifi, Network, Plug, Power, Zap } from "lucide-react";
 import tcpWebSocketService from '../services/TcpWebSocketService';
 import { useRobotContext } from './RobotContext';
+import { GlobalAppContext } from '../contexts/GlobalAppContext'; // Thêm context mới
 
 // Cập nhật interface cho robot
 interface Robot {
   robot_id: string;
   ip: string;
-  active?: boolean; // Thêm thuộc tính active (dùng ? để đánh dấu là tùy chọn)
-  port?: number;     // Thêm port nếu API của bạn cũng trả về thông tin này
+  active?: boolean;
+  port?: number;
+}
+
+interface FirmwareMessage {
+  type: string;
+  robot_id: string;
+  filename?: string;
+  filesize?: number;
+  version?: string;
+  ota_port?: number;
+  target_ip?: string;
+  target_port?: number;
+  chunk_index?: number;
+  total_chunks?: number;
+  data?: string;
+  binary_format?: boolean; 
 }
 
 const FirmwareUpdateWidget: React.FC = () => {
   const { selectedRobotId } = useRobotContext();
+  const { setFirmwareUpdateMode } = useContext(GlobalAppContext); // Sử dụng context
+  
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [uploadStatus, setUploadStatus] = useState<'idle' | 'uploading' | 'success' | 'error'>('idle');
   const [progress, setProgress] = useState(0);
@@ -24,6 +42,20 @@ const FirmwareUpdateWidget: React.FC = () => {
   const [useIpAddress, setUseIpAddress] = useState(false);
   const [ipAddress, setIpAddress] = useState("");
   const [availableRobots, setAvailableRobots] = useState<Robot[]>([]);
+  
+  // Thêm trạng thái kết nối OTA0
+  const [ota0Connected, setOta0Connected] = useState(false);
+  const [ota0Connecting, setOta0Connecting] = useState(false);
+  const [ota0Error, setOta0Error] = useState<string | null>(null);
+  
+  // Thêm cấu hình OTA ports
+  const [otaConfig, setOtaConfig] = useState({
+    OTA0: { port: 12345, description: "Firmware Update" },
+    OTA1: { port: 12346, description: "Data (Encoder/IMU)" }
+  });
+
+  // Sử dụng OTA0 cho cập nhật firmware
+  const FIRMWARE_PORT = otaConfig.OTA0.port;
 
   useEffect(() => {
     if (selectedRobotId) {
@@ -87,16 +119,29 @@ const FirmwareUpdateWidget: React.FC = () => {
       if (message.type === "firmware_response") {
         if (message.status === "success") {
           setUploadStatus('success');
+          setFirmwareUpdateMode(false); // Tắt chế độ firmware update
           setTimeout(() => setUploadStatus('idle'), 3000);
         } else if (message.status === "error") {
           setErrorMessage(message.message || "Lỗi không xác định");
           setUploadStatus('error');
           setTimeout(() => setUploadStatus('idle'), 5000);
+          setFirmwareUpdateMode(false); // Tắt chế độ firmware update nếu có lỗi
         }
       } else if (message.type === "firmware_progress") {
         setProgress(message.progress || 0);
       } else if (message.type === "firmware_version") {
         setCurrentVersion(message.version || "Unknown");
+      } else if (message.type === "ota0_connection_response") {
+        // Xử lý phản hồi từ kết nối OTA0
+        if (message.status === "connected") {
+          setOta0Connected(true);
+          setOta0Connecting(false);
+          setOta0Error(null);
+        } else if (message.status === "error") {
+          setOta0Connected(false);
+          setOta0Connecting(false);
+          setOta0Error(message.message || "Không thể kết nối đến OTA0");
+        }
       }
     };
 
@@ -104,12 +149,14 @@ const FirmwareUpdateWidget: React.FC = () => {
       setErrorMessage(message.message || "Lỗi không xác định");
       setUploadStatus('error');
       setTimeout(() => setUploadStatus('idle'), 5000);
+      setFirmwareUpdateMode(false); // Tắt chế độ firmware update nếu có lỗi
     };
 
     tcpWebSocketService.onConnectionChange(handleConnectionChange);
     tcpWebSocketService.onMessage('firmware_response', handleFirmwareResponse);
     tcpWebSocketService.onMessage('firmware_progress', handleFirmwareResponse);
     tcpWebSocketService.onMessage('firmware_version', handleFirmwareResponse);
+    tcpWebSocketService.onMessage('ota0_connection_response', handleFirmwareResponse);
     tcpWebSocketService.onMessage('error', handleErrorResponse);
 
     setIsConnected(tcpWebSocketService.isConnected());
@@ -119,9 +166,96 @@ const FirmwareUpdateWidget: React.FC = () => {
       tcpWebSocketService.offMessage('firmware_response', handleFirmwareResponse);
       tcpWebSocketService.offMessage('firmware_progress', handleFirmwareResponse);
       tcpWebSocketService.offMessage('firmware_version', handleFirmwareResponse);
+      tcpWebSocketService.offMessage('ota0_connection_response', handleFirmwareResponse);
       tcpWebSocketService.offMessage('error', handleErrorResponse);
     };
-  }, []);
+  }, [setFirmwareUpdateMode]);
+  
+  // Hàm kết nối đến OTA0
+  const connectToOta0 = async () => {
+    if (!ipAddress) {
+      setOta0Error("Vui lòng nhập địa chỉ IP của robot");
+      return;
+    }
+    
+    setOta0Connecting(true);
+    setOta0Error(null);
+    
+    // Kích hoạt chế độ update firmware - vô hiệu hóa các widget khác
+    setFirmwareUpdateMode(true);
+    
+    try {
+      // Gửi yêu cầu kết nối OTA0 cho firmware update
+      tcpWebSocketService.sendMessage({
+        type: "connect_ota0",
+        ip_address: ipAddress,
+        port: FIRMWARE_PORT,  // Sử dụng FIRMWARE_PORT cho firmware
+        robot_id: selectedRobotId
+      });
+      
+      // Kết nối được xử lý trong useEffect với message listener
+    } catch (error) {
+      console.error("Lỗi khi kết nối OTA:", error);
+      setOta0Connected(false);
+      setOta0Connecting(false);
+      setOta0Error("Lỗi khi yêu cầu kết nối OTA");
+      setFirmwareUpdateMode(false);
+    }
+  };
+  
+  // Hàm ngắt kết nối OTA0
+  const disconnectOta0 = () => {
+    tcpWebSocketService.sendMessage({
+      type: "disconnect_ota0",
+      robot_id: selectedRobotId,
+      ip_address: ipAddress
+    });
+    
+    setOta0Connected(false);
+    setFirmwareUpdateMode(false); // Tắt chế độ firmware update
+  };
+
+  // Hàm tự động kết nối OTA0
+  const autoConnectOTA0 = async () => {
+    if (!isConnected) {
+      setErrorMessage("Vui lòng kết nối DirectBridge trước");
+      return;
+    }
+    
+    setOta0Connecting(true);
+    setOta0Error(null);
+    setFirmwareUpdateMode(true);
+    
+    try {
+      // Use selectedRobotId regardless of availableRobots
+      let targetIp = ipAddress;
+      
+      // If no IP address set, use localhost
+      if (!targetIp) {
+        targetIp = "127.0.0.1";
+        setIpAddress(targetIp);
+        setUseIpAddress(true);
+      }
+      
+      console.log(`Đang kết nối OTA0 đến ${selectedRobotId} (${targetIp}:${FIRMWARE_PORT})...`);
+      
+      // Gửi yêu cầu kết nối đến DirectBridge
+      tcpWebSocketService.sendMessage({
+        type: "connect_ota0",
+        ip_address: targetIp,
+        port: FIRMWARE_PORT,
+        robot_id: selectedRobotId
+      });
+      
+      console.log(`Đã gửi yêu cầu kết nối OTA0 tới ${targetIp}:${FIRMWARE_PORT}`);
+    } catch (error) {
+      console.error("Lỗi khi tự kết nối OTA0:", error);
+      setOta0Connected(false);
+      setOta0Connecting(false);
+      setOta0Error("Lỗi khi tự kết nối: " + (error instanceof Error ? error.message : String(error)));
+      setFirmwareUpdateMode(false);
+    }
+  };
 
   const sendFirmware = async () => {
     if (!selectedFile || !isConnected) {
@@ -131,8 +265,9 @@ const FirmwareUpdateWidget: React.FC = () => {
       return;
     }
 
-    if (useIpAddress && !ipAddress) {
-      setErrorMessage("Vui lòng nhập địa chỉ IP của robot");
+    // Kiểm tra kết nối OTA0 trước khi gửi firmware
+    if (!ota0Connected) {
+      setErrorMessage("Chưa kết nối tới OTA0. Vui lòng kết nối trước khi cập nhật firmware.");
       setUploadStatus('error');
       setTimeout(() => setUploadStatus('idle'), 5000);
       return;
@@ -142,16 +277,19 @@ const FirmwareUpdateWidget: React.FC = () => {
       setUploadStatus('uploading');
       setProgress(0);
 
-      const messageStart = {
+      const messageStart: FirmwareMessage = {
         type: "firmware_update_start",
         robot_id: selectedRobotId,
         filename: selectedFile.name,
         filesize: selectedFile.size,
-        version: "1.0.1"
+        version: "1.0.1",
+        ota_port: FIRMWARE_PORT,
+        binary_format: true // Thêm flag để xác định đây là dữ liệu binary
       };
 
       if (useIpAddress && ipAddress) {
-        (messageStart as any).target_ip = ipAddress;
+        messageStart.target_ip = ipAddress;
+        messageStart.target_port = FIRMWARE_PORT;
       }
 
       const success = tcpWebSocketService.sendMessage(messageStart);
@@ -171,11 +309,12 @@ const FirmwareUpdateWidget: React.FC = () => {
         const arrayBuffer = event.target.result as ArrayBuffer;
         const bytes = new Uint8Array(arrayBuffer);
 
-        const chunkSize = 1024;
+        const chunkSize = 1024; // Kích thước chunk 1KB phù hợp với ESP32
         const totalChunks = Math.ceil(bytes.length / chunkSize);
 
         console.log(`Gửi firmware trong ${totalChunks} chunks, mỗi chunk ${chunkSize} bytes`);
 
+        // Cập nhật hàm gửi chunk để xử lý đúng định dạng dữ liệu
         const sendChunkWithDelay = (chunkIndex: number): Promise<void> => {
           return new Promise((resolve, reject) => {
             setTimeout(() => {
@@ -189,22 +328,26 @@ const FirmwareUpdateWidget: React.FC = () => {
                 const end = Math.min(bytes.length, start + chunkSize);
                 const chunk = bytes.slice(start, end);
 
+                // Mã hóa chunk thành base64 (DirectBridge sẽ giải mã)
                 const base64Chunk = btoa(
                   Array.from(chunk)
                     .map(byte => String.fromCharCode(byte))
                     .join('')
                 );
 
-                const chunkMessage: any = {
+                const chunkMessage: FirmwareMessage = {
                   type: "firmware_chunk",
                   robot_id: selectedRobotId,
                   chunk_index: chunkIndex,
                   total_chunks: totalChunks,
-                  data: base64Chunk
+                  data: base64Chunk,
+                  ota_port: FIRMWARE_PORT,
+                  binary_format: true // Thêm flag để xác định đây là dữ liệu binary
                 };
 
                 if (useIpAddress && ipAddress) {
                   chunkMessage.target_ip = ipAddress;
+                  chunkMessage.target_port = FIRMWARE_PORT;
                 }
 
                 const success = tcpWebSocketService.sendMessage(chunkMessage);
@@ -217,27 +360,36 @@ const FirmwareUpdateWidget: React.FC = () => {
                 const currentProgress = Math.round((chunkIndex + 1) / totalChunks * 100);
                 setProgress(currentProgress);
 
+                // Log tiến trình để debug
+                if (chunkIndex % 10 === 0 || chunkIndex === totalChunks - 1) {
+                  console.log(`Đã gửi chunk ${chunkIndex + 1}/${totalChunks} (${currentProgress}%)`);
+                }
+
                 sendChunkWithDelay(chunkIndex + 1).then(resolve).catch(reject);
 
               } catch (error) {
                 reject(error);
               }
-            }, 100);
+            }, 100); // Giữ độ trễ 100ms giữa các chunk để không làm quá tải ESP32
           });
         };
 
         await sendChunkWithDelay(0);
 
-        const completeMessage: any = {
+        const completeMessage: FirmwareMessage = {
           type: "firmware_update_complete",
-          robot_id: selectedRobotId
+          robot_id: selectedRobotId,
+          ota_port: FIRMWARE_PORT,
+          binary_format: true
         };
 
         if (useIpAddress && ipAddress) {
           completeMessage.target_ip = ipAddress;
+          completeMessage.target_port = FIRMWARE_PORT;
         }
 
         tcpWebSocketService.sendMessage(completeMessage);
+        console.log("Đã gửi tin nhắn hoàn tất cập nhật firmware");
       };
 
       reader.onerror = () => {
@@ -249,6 +401,7 @@ const FirmwareUpdateWidget: React.FC = () => {
       setUploadStatus('error');
       setErrorMessage(error instanceof Error ? error.message : "Lỗi không xác định");
       setTimeout(() => setUploadStatus('idle'), 5000);
+      setFirmwareUpdateMode(false); // Tắt chế độ firmware update nếu có lỗi
     }
   };
 
@@ -322,6 +475,82 @@ const FirmwareUpdateWidget: React.FC = () => {
       </div>
 
       <div className="mb-4">
+        <button
+          onClick={autoConnectOTA0}
+          disabled={!isConnected || ota0Connected || ota0Connecting}
+          className={`w-full py-2 rounded-md flex items-center justify-center gap-2
+            ${(!isConnected || ota0Connected || ota0Connecting)
+              ? 'bg-gray-100 text-gray-400 cursor-not-allowed'
+              : 'bg-blue-600 text-white hover:bg-blue-700'}`}
+        >
+          {ota0Connecting ? (
+            <>
+              <RefreshCw size={16} className="animate-spin" />
+              <span>Đang kết nối OTA0...</span>
+            </>
+          ) : (
+            <>
+              <Zap size={16} />
+              <span>Tự động kết nối OTA0 cho robot {selectedRobotId}</span>
+            </>
+          )}
+        </button>
+      </div>
+
+      {/* Thêm trạng thái và nút kết nối OTA0 */}
+      <div className="mb-4 flex items-center justify-between bg-yellow-50 p-3 rounded-md">
+        <div className="flex items-center">
+          <div className={`w-3 h-3 rounded-full mr-2 ${
+            ota0Connected ? 'bg-green-500' : (ota0Connecting ? 'bg-yellow-500' : 'bg-gray-400')
+          }`}></div>
+          <span>
+            {ota0Connected ? `Đã kết nối OTA0 (port ${FIRMWARE_PORT})` : 
+             (ota0Connecting ? 'Đang kết nối OTA...' : 'Chưa kết nối OTA')}
+          </span>
+        </div>
+
+        {/* Nút kết nối/ngắt kết nối */}
+        {!ota0Connected ? (
+          <button
+            onClick={connectToOta0}
+            disabled={!isConnected || ota0Connecting || !ipAddress}
+            className={`px-3 py-1 text-sm rounded flex items-center gap-1 ${
+              !isConnected || ota0Connecting || !ipAddress
+                ? 'bg-gray-400 text-gray-200 cursor-not-allowed'
+                : 'bg-yellow-600 text-white hover:bg-yellow-700'
+            }`}
+          >
+            {ota0Connecting ? (
+              <>
+                <RefreshCw size={14} className="animate-spin" />
+                <span>Đang kết nối...</span>
+              </>
+            ) : (
+              <>
+                <Plug size={14} />
+                <span>Kết nối OTA0</span>
+              </>
+            )}
+          </button>
+        ) : (
+          <button
+            onClick={disconnectOta0}
+            className="px-3 py-1 bg-red-600 text-white text-sm rounded hover:bg-red-700 flex items-center gap-1"
+          >
+            <Power size={14} />
+            <span>Ngắt kết nối</span>
+          </button>
+        )}
+      </div>
+
+      {ota0Error && (
+        <div className="mb-4 bg-red-50 border-l-4 border-red-500 text-red-700 p-3 rounded">
+          <p className="font-medium">Lỗi kết nối OTA0</p>
+          <p>{ota0Error}</p>
+        </div>
+      )}
+
+      <div className="mb-4">
         <label className="flex items-center">
           <input
             type="checkbox"
@@ -383,6 +612,76 @@ const FirmwareUpdateWidget: React.FC = () => {
             )}
           </div>
         )}
+
+        {useIpAddress && (
+          <>
+            <div className="mt-4">
+              <label className="block text-sm font-medium text-gray-700 mb-1">
+                OTA Configuration
+              </label>
+              <div className="grid grid-cols-2 gap-3">
+                <div className="bg-gray-50 p-3 rounded-md border border-gray-200">
+                  <div className="flex items-center justify-between mb-2">
+                    <span className="font-medium text-sm">OTA0 (Firmware)</span>
+                    <div className="bg-green-100 text-green-800 text-xs px-2 py-0.5 rounded-full">
+                      Primary
+                    </div>
+                  </div>
+                  <div className="flex items-center">
+                    <span className="mr-2 text-sm">Port:</span>
+                    <input
+                      type="number"
+                      value={FIRMWARE_PORT}
+                      onChange={(e) => setOtaConfig(prev => ({
+                        ...prev,
+                        OTA0: {
+                          ...prev.OTA0,
+                          port: parseInt(e.target.value, 10)
+                        }
+                      }))}
+                      className="w-24 p-1 border border-gray-300 rounded-md text-sm"
+                      disabled={ota0Connected} // Không cho phép thay đổi khi đã kết nối
+                    />
+                  </div>
+                </div>
+                
+                <div className="bg-gray-50 p-3 rounded-md border border-gray-200">
+                  <div className="flex items-center justify-between mb-2">
+                    <span className="font-medium text-sm">OTA1 (Data)</span>
+                    <div className="bg-gray-100 text-gray-600 text-xs px-2 py-0.5 rounded-full">
+                      Secondary
+                    </div>
+                  </div>
+                  <div className="flex items-center">
+                    <span className="mr-2 text-sm">Port:</span>
+                    <input
+                      type="number"
+                      value={otaConfig.OTA1.port}
+                      onChange={(e) => setOtaConfig(prev => ({
+                        ...prev,
+                        OTA1: {
+                          ...prev.OTA1,
+                          port: parseInt(e.target.value, 10)
+                        }
+                      }))}
+                      className="w-24 p-1 border border-gray-300 rounded-md text-sm"
+                      disabled={true} // Luôn disabled vì không sử dụng trong widget này
+                    />
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            {/* Thêm thông tin trợ giúp về OTA0 và OTA1 */}
+            <div className="mt-2 bg-blue-50 p-3 rounded-md text-sm text-blue-800">
+              <p className="font-medium mb-1">Thông tin về kết nối OTA:</p>
+              <ul className="list-disc pl-4 space-y-1">
+                <li><strong>OTA0 (port {FIRMWARE_PORT})</strong>: Được sử dụng để cập nhật firmware</li>
+                <li><strong>OTA1 (port {otaConfig.OTA1.port})</strong>: Được sử dụng cho dữ liệu IMU, Encoder và các tính năng khác</li>
+              </ul>
+            </div>
+          </>
+        )}
       </div>
 
       <div className="mb-4">
@@ -442,9 +741,9 @@ const FirmwareUpdateWidget: React.FC = () => {
       <div className="flex justify-end mt-2">
         <button
           onClick={sendFirmware}
-          disabled={!selectedFile || !isConnected || uploadStatus === 'uploading' || (useIpAddress && !ipAddress)}
+          disabled={!selectedFile || !isConnected || uploadStatus === 'uploading' || !ota0Connected}
           className={`px-4 py-2 rounded-md flex items-center gap-2
-            ${!selectedFile || !isConnected || uploadStatus === 'uploading' || (useIpAddress && !ipAddress)
+            ${!selectedFile || !isConnected || uploadStatus === 'uploading' || !ota0Connected
               ? 'bg-gray-100 text-gray-400 cursor-not-allowed'
               : 'bg-blue-600 text-white hover:bg-blue-700'
             }`}
@@ -457,7 +756,7 @@ const FirmwareUpdateWidget: React.FC = () => {
           ) : (
             <>
               <Upload size={16} />
-              <span>{useIpAddress ? 'Cập nhật firmware qua IP' : 'Cập nhật firmware'}</span>
+              <span>Cập nhật firmware</span>
             </>
           )}
         </button>
